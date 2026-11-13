@@ -1,0 +1,58 @@
+# Git / VCS
+.git/
+.gitignore.mine
+
+# CodeGenie (AI 插件本地目录)
+.codegenie/
+
+# DevEco Studio / HarmonyOS 构建产物
+.hvigor/
+build/
+oh_modules/
+entry/build/
+entry/oh_modules/
+
+# 本地配置
+local.properties
+.idea/
+*.iml
+
+# Java / 通用
+*.class
+*.jar
+!gradle-wrapper.jar
+
+# 日志
+*.log
+
+# 操作系统
+.DS_Store
+Thumbs.db
+
+# 密钥与敏感信息，切勿上传
+*.p12
+*.cer
+*.p7b
+*.pem
+*.pfx
+*.keystore
+*.jks
+*.key
+sign/
+# 本机 DevEco 密钥配置不要合入 Git；发布时在本机设置 signingConfig。
+# Preview
+entry/.preview/
+
+# GitHub Token (local only, never commit)
+.github-token
+
+# 本地配置、密钥申请材料与打包产物
+.env
+.env.*
+*.csr
+*.crt
+*.der
+*.zip
+*.hap
+*.app
+_pull_latest.ps1

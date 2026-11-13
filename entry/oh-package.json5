@@ -1,0 +1,10 @@
+{
+  "name": "entry",
+  "version": "1.0.0",
+  "description": "LyricFlow entry module",
+  "main": "Index.ets",
+  "dependencies": {
+    "@dabing/taglib_harmony": "1.1.2"
+  },
+  "devDependencies": {}
+}

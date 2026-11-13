@@ -1,0 +1,10 @@
+{
+  "string": [
+    { "name": "module_desc", "value": "LyricFlow music metadata and lyrics editor" },
+    { "name": "EntryAbility_desc", "value": "LyricFlow" },
+    { "name": "app_name", "value": "LyricFlow" },
+    { "name": "folder_permission_reason", "value": "用于持久保留所选文件夹的访问授权，以便后续只读扫描与匹配" },
+    { "name": "download_permission_reason", "value": "用于将歌词和音频文件导出到下载目录" },
+    { "name": "write_audio_experiment_reason", "value": "经您确认后，将标签、封面和歌词保存回选定音频，并事先创建备份" }
+  ]
+}
