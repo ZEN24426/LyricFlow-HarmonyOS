@@ -1,5 +1,6 @@
 import { fileIo } from '@kit.CoreFileKit';
-import { AudioMetadataWriter } from '@dabing/taglib_harmony';
+import { AudioMetadataWriter } from './AudioMetadataTypes';
+import { assertBareMp3Frames } from './BareMp3';
 
 // Conservative ID3v2.3 / 2.4 verifier. Unsupported tags are rejected.
 const IO_CHUNK: number = 256 * 1024;
@@ -51,10 +52,14 @@ async function assertZero(fd: number, offset: number, length: number): Promise<v
   }
 }
 
-async function parseId3(fd: number): Promise<Id3Layout> {
+async function parseId3(fd: number, allowBare: boolean = false): Promise<Id3Layout> {
   const st: fileIo.Stat = fileIo.statSync(fd);
   if (!st.isFile() || !Number.isSafeInteger(st.size) || st.size < 11) throw new Error('MP3 文件无效或为空。');
   const h: Uint8Array = await readAt(fd, 0, 10);
+  if (allowBare && (h[0] !== 0x49 || h[1] !== 0x44 || h[2] !== 0x33)) {
+    await assertBareMp3Frames(fd, st.size);
+    return { version: 4, tail: 0, size: st.size, frames: [] };
+  }
   if (h[0] !== 0x49 || h[1] !== 0x44 || h[2] !== 0x33 || (h[3] !== 3 && h[3] !== 4) ||
       h[4] !== 0 || h[5] !== 0) {
     throw new Error('仅支持无扩展头、无不同步处理和无特殊标志的 ID3v2.3/2.4。');
@@ -397,7 +402,7 @@ export async function verifyId3Integrity(backupPath: string, stagedPath: string,
   let right: fileIo.File | undefined = undefined;
   try {
     right = await fileIo.open(stagedPath, fileIo.OpenMode.READ_ONLY);
-    const before: Id3Layout = await parseId3(left.fd);
+    const before: Id3Layout = await parseId3(left.fd, true);
     const after: Id3Layout = await parseId3(right.fd);
     await refuseCompetingTailTags(left.fd, before);
     await refuseCompetingTailTags(right.fd, after);

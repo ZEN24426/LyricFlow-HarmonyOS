@@ -1,5 +1,5 @@
 import { image } from '@kit.ImageKit';
-import { AudioMetadata, AudioMetadataWriter } from '@dabing/taglib_harmony';
+import { AudioMetadata, AudioMetadataWriter } from './AudioMetadataTypes';
 
 /** The verified result must contain every field the writer was asked to set. */
 function assertText(name: string, expected: string | undefined, actual: string): void {
@@ -152,7 +152,8 @@ function assertPreservedNumber(name: string, before: number, after: number): voi
 export async function verifyPreservedMetadata(
   expected: AudioMetadataWriter,
   before: AudioMetadata,
-  after: AudioMetadata
+  after: AudioMetadata,
+  verifyDuration: boolean = true
 ): Promise<void> {
   if (expected.title === undefined) assertPreservedText('标题', before.title, after.title);
   if (expected.artist === undefined) assertPreservedText('歌手', before.artist, after.artist);
@@ -182,8 +183,12 @@ export async function verifyPreservedMetadata(
       await assertCover(before.coverImage, after.coverImage);
     }
   }
-  assertPreservedNumber('时长', before.duration, after.duration);
-  assertPreservedNumber('精确时长', before.durationMs, after.durationMs);
+  // ADTS callers can skip extractor-derived duration only when a separate
+  // format verifier checks the complete audio stream byte for byte.
+  if (verifyDuration) {
+    assertPreservedNumber('时长', before.duration, after.duration);
+    assertPreservedNumber('精确时长', before.durationMs, after.durationMs);
+  }
   assertPreservedNumber('采样率', before.sampleRate, after.sampleRate);
   assertPreservedNumber('声道数', before.channels, after.channels);
   assertPreservedText('文件类型', before.fileType, after.fileType);

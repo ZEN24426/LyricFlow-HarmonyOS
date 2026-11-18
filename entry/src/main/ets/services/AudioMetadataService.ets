@@ -1,7 +1,47 @@
 import { fileIo, fileUri } from '@kit.CoreFileKit';
-import { AudioMetadata, AudioMetadataWriter, readAudioMetadata, writeAudioMetadata } from '@dabing/taglib_harmony';
-import { Mp3Numbers, readMp3Numbers } from './Mp3DirectWriter';
-import { repairFlacBpm } from './FlacBpmWriter';
+import { AudioMetadata, AudioMetadataWriter } from './AudioMetadataTypes';
+import { readMp3Metadata } from './Mp3MetadataReader';
+import { readFlacMetadata, writeFlacMetadata } from './OwnFlacMetadata';
+import { readWavMetadata, writeWavMetadata, verifyWavIntegrity } from './OwnWavMetadata';
+import { readM4aMetadata, writeM4aMetadata, verifyM4aIntegrity } from './OwnM4aMetadata';
+import { readAiffMetadata, writeAiffMetadata, verifyAiffIntegrity } from './OwnAiffMetadata';
+import { readOggMetadata, writeOggMetadata, verifyOggIntegrity } from './OwnOggMetadata';
+import { readAdtsMetadata, writeAdtsMetadata, verifyAdtsIntegrity } from './OwnAdtsMetadata';
+import { fillAudioProperties } from './SystemAudioProperties';
+import { writeMp3MetadataCopy } from './Mp3DirectWriter';
+import { verifyWrittenMetadata, verifyPreservedMetadata } from './MetadataVerification';
+import { verifyId3Integrity } from './Id3Integrity';
+import { verifyFlacIntegrity } from './FlacIntegrity';
+
+
+async function readAudioMetadata(path: string, filesDir: string): Promise<AudioMetadata> {
+  let result: AudioMetadata;
+  if (/\.mp3$/i.test(path)) result = await readMp3Metadata(path);
+  else if (/\.flac$/i.test(path)) result = await readFlacMetadata(path);
+  else if (/\.wav$/i.test(path)) result = await readWavMetadata(path, filesDir);
+  else if (/\.m4a$/i.test(path)) result = await readM4aMetadata(path);
+  else if (/\.(aif|aiff)$/i.test(path)) result = await readAiffMetadata(path, filesDir);
+  else if (/\.(ogg|opus)$/i.test(path)) result = await readOggMetadata(path);
+  else if (/\.aac$/i.test(path)) result = await readAdtsMetadata(path);
+  else throw new Error('此音频格式暂不支持独立标签读取，未修改文件。');
+  try {
+    // FLAC STREAMINFO contains sample count, rate and channels without estimating.
+    // Unknown total samples still require the system extractor.
+    const parsedRate: number = result.sampleRate;
+    const parsedChannels: number = result.channels;
+    if (!/\.flac$/i.test(path) || result.durationMs <= 0) await fillAudioProperties(path, result);
+    if (/\.(ogg|opus)$/i.test(path) &&
+        (result.channels !== parsedChannels || (result.fileType === 'audio/ogg' && result.sampleRate !== parsedRate))) {
+      throw new Error('Ogg 音频头与系统识别的声道或采样率不一致。');
+    }
+    return result;
+  } catch (error) {
+    if (result.coverImage !== undefined) {
+      try { await result.coverImage.release(); } catch (_releaseError) {}
+    }
+    throw error as Error;
+  }
+}
 
 export interface WorkingAudio {
   sourceUri: string;
@@ -105,25 +145,13 @@ export class AudioMetadataService {
     }
   }
 
-  static async read(workingPath: string): Promise<AudioMetadata> {
-    return await readAudioMetadata(workingPath);
+  static async read(workingPath: string, filesDir: string): Promise<AudioMetadata> {
+    return await readAudioMetadata(workingPath, filesDir);
   }
 
-  /** Correct the bridge's incomplete MP3 number/total parsing for private copies. */
+  /** The self-contained readers return track and disc totals directly. */
   static async readForDirect(workingPath: string, filesDir: string, strict: boolean = true): Promise<AudioMetadata> {
-    const metadata: AudioMetadata = await readAudioMetadata(workingPath);
-    if (/\.mp3$/i.test(workingPath)) {
-      try {
-        const numbers: Mp3Numbers = await readMp3Numbers(filesDir, workingPath);
-        metadata.track = numbers.track;
-        metadata.trackTotal = numbers.trackTotal;
-        metadata.disc = numbers.disc;
-        metadata.discTotal = numbers.discTotal;
-      } catch (error) {
-        if (strict) throw error as Error;
-      }
-    }
-    return metadata;
+    return await readAudioMetadata(workingPath, filesDir);
   }
 
   static canReadDirectly(uri: string): boolean {
@@ -148,7 +176,7 @@ export class AudioMetadataService {
     if (sourcePath.indexOf('/storage/Users/') === 0 ||
         sourcePath.indexOf('/data/storage/') === 0) {
       try {
-        const metadata: AudioMetadata = await readAudioMetadata(sourcePath);
+        const metadata: AudioMetadata = await readAudioMetadata(sourcePath, filesDir);
         return { metadata, usedSandboxCopy: false };
       } catch (_directReadError) {
         if (!allowSandboxCopy) throw new Error('此文件的直接标签读取失败；为避免复制大量音频，本轮跳过沙箱副本回退。');
@@ -165,17 +193,43 @@ export class AudioMetadataService {
     }
   }
 
-  static async write(workingPath: string, fields: AudioMetadataWriter): Promise<void> {
-    const success: boolean = await writeAudioMetadata(workingPath, fields);
-    if (!success) throw new Error('音频标签库未能确认写入成功。');
-    if (fields.bpm !== undefined) await repairFlacBpm(workingPath, fields.bpm);
-    // Re-read after writing to verify the file remains parseable.
-    // User-editable fields (title, artist, album, composer, lyrics, etc.) are not
-    // compared against the re-read values, because the metadata writer may normalize
-    // values (encoding, whitespace, etc.) which would cause false validation failures.
-    const actual: AudioMetadata = await readAudioMetadata(workingPath);
-    if (fields.bpm !== undefined && actual.bpm !== fields.bpm) {
-      throw new Error('音频 BPM 写入后回读不一致，已取消保存。');
+  static async write(workingPath: string, fields: AudioMetadataWriter, filesDir: string): Promise<void> {
+    // Caller supplies its application-private root, never a user-selected URI.
+    const root: string = filesDir.endsWith('/') ? filesDir.substring(0, filesDir.length - 1) : filesDir;
+    const segments: string[] = workingPath.split('/');
+    if (!root.startsWith('/') || !workingPath.startsWith(root + '/') || root.indexOf('\\') >= 0 ||
+        workingPath.indexOf('\\') >= 0 || segments.indexOf('..') >= 0 || segments.indexOf('.') >= 0 ||
+        workingPath.indexOf('\u0000') >= 0) throw new Error('仅允许修改应用私有目录内的工作副本。');
+    const before: AudioMetadata = await AudioMetadataService.readForDirect(workingPath, root);
+    let after: AudioMetadata | undefined = undefined;
+    let staged: string = '';
+    try {
+      if (/\.mp3$/i.test(workingPath)) staged = await writeMp3MetadataCopy(root, workingPath, fields);
+      else if (/\.flac$/i.test(workingPath)) staged = await writeFlacMetadata(root, workingPath, fields);
+      else if (/\.wav$/i.test(workingPath)) staged = await writeWavMetadata(root, workingPath, fields);
+      else if (/\.m4a$/i.test(workingPath)) staged = await writeM4aMetadata(root, workingPath, fields);
+      else if (/\.(aif|aiff)$/i.test(workingPath)) staged = await writeAiffMetadata(root, workingPath, fields);
+      else if (/\.(ogg|opus)$/i.test(workingPath)) staged = await writeOggMetadata(root, workingPath, fields);
+      else if (/\.aac$/i.test(workingPath)) staged = await writeAdtsMetadata(root, workingPath, fields);
+      else throw new Error('此音频格式暂不支持独立标签写入，未修改文件。');
+      after = await AudioMetadataService.readForDirect(staged, root);
+      await verifyWrittenMetadata(fields, after);
+      await verifyPreservedMetadata(fields, before, after, !/\.aac$/i.test(workingPath));
+      if (/\.mp3$/i.test(workingPath)) await verifyId3Integrity(workingPath, staged, fields);
+      else if (/\.flac$/i.test(workingPath)) await verifyFlacIntegrity(workingPath, staged, fields);
+      else if (/\.wav$/i.test(workingPath)) await verifyWavIntegrity(workingPath, staged);
+      else if (/\.m4a$/i.test(workingPath)) await verifyM4aIntegrity(workingPath, staged, fields);
+      else if (/\.(aif|aiff)$/i.test(workingPath)) await verifyAiffIntegrity(workingPath, staged);
+      else if (/\.(ogg|opus)$/i.test(workingPath)) await verifyOggIntegrity(workingPath, staged, fields);
+      else await verifyAdtsIntegrity(root, workingPath, staged, fields);
+      fileIo.renameSync(staged, workingPath);
+    } finally {
+      if (before.coverImage !== undefined) { try { await before.coverImage.release(); } catch (_error) {} }
+      if (after !== undefined && after.coverImage !== undefined) { try { await after.coverImage.release(); } catch (_error) {} }
+      if (staged.length > 0) {
+        try { fileIo.unlinkSync(staged); } catch (_error) {}
+        try { fileIo.rmdirSync(staged.substring(0, staged.lastIndexOf('/'))); } catch (_error) {}
+      }
     }
   }
 

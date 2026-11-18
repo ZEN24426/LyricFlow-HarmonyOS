@@ -197,6 +197,9 @@ export class FolderScanner {
             audio.uri, audio.name, filesDir, allowCopy, () => { sandboxCopies++; });
           audio.title = readResult.metadata.title;
           audio.artist = readResult.metadata.artist;
+          if (readResult.metadata.coverImage !== undefined) {
+            try { await readResult.metadata.coverImage.release(); } catch (_releaseError) {}
+          }
         } catch (error) {
           const detail: string = error instanceof Error ? error.message : '未知错误';
           addWarning(warnings, '未能读取音频标签，改用文件名匹配：' + audio.name + '（' + detail + '）');

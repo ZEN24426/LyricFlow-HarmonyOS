@@ -1,6 +1,6 @@
 import { common } from '@kit.AbilityKit';
 import { fileIo } from '@kit.CoreFileKit';
-import { AudioMetadataWriter } from '@dabing/taglib_harmony';
+import { AudioMetadataWriter } from './AudioMetadataTypes';
 import { AudioMetadataService } from './AudioMetadataService';
 import { DirectAudioWriteService, DirectWriteReport } from './DirectAudioWriteService';
 import { FileSelectionService } from './FileSelectionService';

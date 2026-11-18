@@ -1,5 +1,5 @@
 import { fileIo } from '@kit.CoreFileKit';
-import { AudioMetadataWriter } from '@dabing/taglib_harmony';
+import { AudioMetadataWriter } from './AudioMetadataTypes';
 
 // RFC 9639 and Xiph Vorbis comments: field names are ASCII and
 // case-insensitive; values (including duplicate values) are byte-preserved.

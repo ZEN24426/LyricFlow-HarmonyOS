@@ -1,5 +1,5 @@
 import { common } from '@kit.AbilityKit';
-import { AudioMetadataWriter } from '@dabing/taglib_harmony';
+import { AudioMetadataWriter } from './AudioMetadataTypes';
 import { AudioMetadataService } from './AudioMetadataService';
 import { DirectAudioWriteService } from './DirectAudioWriteService';
 import { ExportService } from './ExportService';
@@ -60,7 +60,12 @@ export class AudioSaveService {
       exportPath = await AudioMetadataService.makeWorkingCopy(
         request.workingPath, request.context.filesDir, request.sourceName
       );
-      await AudioMetadataService.write(exportPath, request.fields);
+      // An untouched fixed-layout format can be exported as an exact copy without rewriting metadata.
+      if (!/\.(m4a|aif|aiff|ogg|opus|aac)$/i.test(request.sourceName) || Object.keys(request.fields).length > 0) {
+        await AudioMetadataService.write(exportPath, request.fields, request.context.filesDir);
+      } else if (!(await AudioMetadataService.filesIdentical(request.workingPath, exportPath))) {
+        throw new Error('原样副本与工作音频不一致，已取消导出。');
+      }
       const name = AudioMetadataService.safeOutputName(request.sourceName, request.fields.title || '');
       const saved = await ExportService.saveAudioToDownload(request.context, name, exportPath);
       if (saved === undefined) {

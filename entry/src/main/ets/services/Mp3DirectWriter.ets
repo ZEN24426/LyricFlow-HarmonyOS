@@ -1,6 +1,9 @@
 import { fileIo } from '@kit.CoreFileKit';
 import { image } from '@kit.ImageKit';
-import { AudioMetadataWriter } from '@dabing/taglib_harmony';
+import { AudioMetadata, AudioMetadataWriter } from './AudioMetadataTypes';
+import { readMp3Metadata } from './Mp3MetadataReader';
+import { fillAudioProperties } from './SystemAudioProperties';
+import { assertBareMp3Frames } from './BareMp3';
 
 // Experimental only: creates a new private staging file, never changes input.
 // Only simple ID3v2.3/2.4 without tag-level transformation is supported.
@@ -394,16 +397,34 @@ export async function writeMp3MetadataCopy(privateRoot: string, sourcePath: stri
   try {
     const stat: fileIo.Stat = fileIo.statSync(source.fd);
     if (!stat.isFile() || !Number.isSafeInteger(stat.size) || stat.size < 11) throw new Error('ID3 工作副本无效。');
-    const header: Uint8Array = await readAt(source.fd, 0, 10);
-    const version: number = header[3];
-    if (header[0] !== 73 || header[1] !== 68 || header[2] !== 51 ||
-        (version !== 3 && version !== 4) || header[4] !== 0 || header[5] !== 0) {
-      throw new Error('仅支持无特殊标志的 ID3v2.3/2.4 工作副本。');
+    let header: Uint8Array = await readAt(source.fd, 0, 10);
+    const bare: boolean = header[0] !== 73 || header[1] !== 68 || header[2] !== 51;
+    let version: number = header[3];
+    let oldSize: number = 0;
+    let end: number = 0;
+    let cursor: number = 0;
+    if (bare) {
+      // No user file is modified. Validate every frame, all the way to EOF,
+      // then require the system extractor to confirm an MPEG audio track.
+      await assertBareMp3Frames(source.fd, stat.size);
+      const metadata: AudioMetadata = await readMp3Metadata(sourcePath);
+      await fillAudioProperties(sourcePath, metadata, true);
+      const byPath: fileIo.Stat = fileIo.statSync(sourcePath);
+      if (!byPath.isFile() || byPath.size !== stat.size || byPath.ino !== stat.ino ||
+          fileIo.statSync(source.fd).size !== stat.size) {
+        throw new Error('验证期间 MP3 工作副本发生变化。');
+      }
+      header = new Uint8Array([73, 68, 51, 4, 0, 0, 0, 0, 0, 0]);
+      version = 4;
+    } else {
+      if ((version !== 3 && version !== 4) || header[4] !== 0 || header[5] !== 0) {
+        throw new Error('仅支持无特殊标志的 ID3v2.3/2.4 工作副本。');
+      }
+      oldSize = getSize(header, 6, true);
+      if (oldSize > MAX_TAG || oldSize > stat.size - 11) throw new Error('ID3 元数据过大或不完整。');
+      end = 10 + oldSize;
+      cursor = 10;
     }
-    const oldSize: number = getSize(header, 6, true);
-    if (oldSize > MAX_TAG || oldSize > stat.size - 11) throw new Error('ID3 元数据过大或不完整。');
-    const end: number = 10 + oldSize;
-    let cursor: number = 10;
     const frames: Frame[] = [];
     while (cursor < end) {
       if ((await readAt(source.fd, cursor, 1))[0] === 0) { await checkPadding(source.fd, cursor, end - cursor); break; }
@@ -475,7 +496,7 @@ export async function writeMp3MetadataCopy(privateRoot: string, sourcePath: stri
     }
     await copyRegion(source.fd, output.fd, paddingStart, end - paddingStart);
     await copyRegion(source.fd, output.fd, end, stat.size - end);
-    if (fileIo.statSync(source.fd).size !== stat.size || fileIo.statSync(output.fd).size !== stat.size + newSize - oldSize) {
+    if (fileIo.statSync(source.fd).size !== stat.size || fileIo.statSync(output.fd).size !== stat.size + newSize - oldSize + (bare ? 10 : 0)) {
       throw new Error('ID3 副本长度校验失败。');
     }
     fileIo.fsyncSync(output.fd);

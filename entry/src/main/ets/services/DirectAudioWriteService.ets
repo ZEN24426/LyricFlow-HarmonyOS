@@ -1,6 +1,7 @@
+import { assertBareMp3Frames } from './BareMp3';
 import { common } from '@kit.AbilityKit';
 import { fileIo, fileUri } from '@kit.CoreFileKit';
-import { AudioMetadata, AudioMetadataWriter } from '@dabing/taglib_harmony';
+import { AudioMetadata, AudioMetadataWriter } from './AudioMetadataTypes';
 import { AudioMetadataService } from './AudioMetadataService';
 import { ExportService, SavedExport } from './ExportService';
 import { verifyWrittenMetadata, verifyPreservedMetadata } from './MetadataVerification';
@@ -76,9 +77,10 @@ async function assertFormatSignature(fd: number, extension: string): Promise<voi
   if (extension === '.flac') return await assertFlacSignature(fd);
   if (fileIo.statSync(fd).size < 10) throw new Error('文件过小，不是受支持的 MP3。');
   const header: Uint8Array = new Uint8Array(await readRange(fd, 0, 4));
-  if (header[0] !== 0x49 || header[1] !== 0x44 || header[2] !== 0x33 ||
-      (header[3] !== 3 && header[3] !== 4)) {
-    throw new Error('仅支持包含 ID3v2.3 或 ID3v2.4 标签的 MP3 直写。');
+  if (header[0] === 0x49 && header[1] === 0x44 && header[2] === 0x33) {
+    if (header[3] !== 3 && header[3] !== 4) throw new Error('仅支持 ID3v2.3/2.4 或无标签 MP3。');
+  } else {
+    await assertBareMp3Frames(fd, fileIo.statSync(fd).size);
   }
 }
 
@@ -226,6 +228,8 @@ export class DirectAudioWriteService {
     let journalActive: boolean = false;
     let journalOperationId: string = '';
     let committed: boolean = false;
+    let before: AudioMetadata | undefined = undefined;
+    let actual: AudioMetadata | undefined = undefined;
     try {
       // This single descriptor is the source of the backup, the commit target,
       // the readback target and, if necessary, the rollback target.
@@ -268,7 +272,7 @@ export class DirectAudioWriteService {
       syncDirectory(tempDir);
       syncDirectory(privateRoot);
       backupVerified = true;
-      const before: AudioMetadata = await AudioMetadataService.readForDirect(backupPath, privateRoot);
+      before = await AudioMetadataService.readForDirect(backupPath, privateRoot);
 
       const safeName: string = AudioMetadataService.safeOutputName(sourceName, '');
       const backupName: string = 'LyricFlow_backup_' + Date.now().toString() + '_' +
@@ -302,9 +306,9 @@ export class DirectAudioWriteService {
           try { fileIo.rmdirSync(editedDir); } catch (_error) {}
         }
       } else {
-        await AudioMetadataService.write(workPath, fields);
+        await AudioMetadataService.write(workPath, fields, privateRoot);
       }
-      const actual: AudioMetadata = await AudioMetadataService.readForDirect(workPath, privateRoot);
+      actual = await AudioMetadataService.readForDirect(workPath, privateRoot);
       await verifyWrittenMetadata(fields, actual);
       await verifyPreservedMetadata(fields, before, actual);
       if (extension === '.mp3') await verifyId3Integrity(backupPath, workPath, fields);
@@ -400,6 +404,12 @@ export class DirectAudioWriteService {
       throw new Error('直写未开始：' + errorMessage(error as Object) +
         (visibleName.length > 0 ? ' 可见备份：' + visibleName + '。' : '') + pendingNote);
     } finally {
+      if (before !== undefined && before.coverImage !== undefined) {
+        try { await before.coverImage.release(); } catch (_error) {}
+      }
+      if (actual !== undefined && actual.coverImage !== undefined) {
+        try { await actual.coverImage.release(); } catch (_error) {}
+      }
       closeFile(work);
       closeFile(backup);
       closeFile(importedSnapshot);

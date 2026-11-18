@@ -13,7 +13,7 @@ import { parseLyricAsync, convertToLrcAsync, matchAsync } from '../services/Back
 import { BusinessError } from '@kit.BasicServicesKit';
 import { FolderAccessService } from '../services/FolderAccessService';
 import { BatchDirectWriteService, BatchDirectWriteResult } from '../services/BatchDirectWriteService';
-import { AudioMetadataWriter } from '@dabing/taglib_harmony';
+import { AudioMetadataWriter } from '../services/AudioMetadataTypes';
 import { image } from '@kit.ImageKit';
 import { pasteboard } from '@kit.BasicServicesKit';
 import { preferences } from '@kit.ArkData';
@@ -448,8 +448,8 @@ struct Index {
       this.isrc = working.metadata.isrc || '';
       this.copyright = working.metadata.copyright || '';
       this.comment = working.metadata.comment || '';
-      this.audioTechnicalSummary = '时长 ' + working.metadata.duration.toString() + ' 秒 · ' +
-        working.metadata.bitrate.toString() + ' kbps · ' + working.metadata.sampleRate.toString() +
+      this.audioTechnicalSummary = (/\.aac$/i.test(this.audioName) ? '约 ' : '时长 ') + working.metadata.duration.toString() + ' 秒 · ' +
+        (working.metadata.bitrate > 0 ? working.metadata.bitrate.toString() + ' kbps' : '码率未知') + ' · ' + working.metadata.sampleRate.toString() +
         ' Hz · ' + working.metadata.channels.toString() + ' 声道 · ' +
         Math.round(working.metadata.fileSize / 1024 / 1024).toString() + ' MiB';
       this.coverPixelMap = working.metadata.coverImage || null;
@@ -459,7 +459,11 @@ struct Index {
         await AudioMetadataService.removeWorkingFile(previousPath);
       }
       // 成功提示仅短暂显示，不占用底部的持久状态栏。
-      this.getUIContext().getPromptAction().showToast({ message: '已成功读取音频元数据', duration: 2000 });
+      if (/\.(ogg|opus)$/i.test(selected.name)) {
+        this.notify('OGG/OPUS 目前仅支持部分单流文件的副本导出，暂不支持更换封面。');
+      } else {
+        this.getUIContext().getPromptAction().showToast({ message: '已成功读取音频元数据', duration: 2000 });
+      }
     } catch (error) {
       this.notify('音频读取失败：' + (this.describeError(error)));
     } finally {
@@ -512,6 +516,7 @@ struct Index {
 
   private async importCover(): Promise<void> {
     if (this.busy) return;
+    if (/\.(ogg|opus)$/i.test(this.audioName)) { this.notify('OGG/OPUS 暂不支持更换封面，原封面会保留。'); return; }
     this.getUIContext().showAlertDialog({
       title: '选择封面来源',
       message: '从哪里选取封面图片？',
@@ -713,7 +718,7 @@ struct Index {
       if (numericFields[i].key === 'trackTotal') writer.trackTotal = numericValue;
       if (numericFields[i].key === 'bpm') writer.bpm = numericValue;
     }
-    if ((!direct || this.coverChanged) && this.coverPixelMap !== null) writer.coverImage = this.coverPixelMap;
+    if (this.coverChanged && this.coverPixelMap !== null) writer.coverImage = this.coverPixelMap;
     return { fields: writer, warning: lyricConversionWarning };
   }
 
@@ -730,7 +735,7 @@ struct Index {
     this.busy = true;
     this.notify('');
     try {
-      const prepared: PreparedAudioMetadata = await this.prepareAudioMetadata();
+      const prepared: PreparedAudioMetadata = await this.prepareAudioMetadata(/\.(m4a|aif|aiff|ogg|opus|aac)$/i.test(this.audioName));
       const saved = await AudioSaveService.save('exportCopy', {
         context: this.ctx(),
         sourceUri: this.audioUri,
@@ -750,10 +755,14 @@ struct Index {
   // 选择直写必须单独确认；重新选择歌曲后始终回到副本导出。
   private selectDirectWriteMode(): void {
     if (this.busy || this.audioSaveMode === 'writeOriginal') return;
+    if (!/\.(mp3|flac)$/i.test(this.audioName)) {
+      this.notify('此音频格式目前只支持导出副本；直写仅支持 MP3 和 FLAC。');
+      return;
+    }
     this.getUIContext().showAlertDialog({
       title: '切换为直写源文件？',
       message: '直写会修改所选原文件。应用会先保存并校验备份，但写入中断、设备故障或其他程序同时修改仍可能导致文件损坏。' +
-        '请保留其他备份。支持 FLAC 和带 ID3v2.3/2.4 的 MP3；无法安全保留标签的文件会在写入前拒绝。',
+        '请保留其他备份。支持 FLAC、无标签 MP3 和带 ID3v2.3/2.4 的 MP3；无法安全保留标签的文件会在写入前拒绝。',
       primaryButton: { value: '取消', action: () => {} },
       secondaryButton: { value: '了解风险，切换', action: () => { this.audioSaveMode = 'writeOriginal'; } }
     });
@@ -1076,10 +1085,12 @@ struct Index {
         let sourceWorkingPath: string = '';
         let exportPath: string = '';
         let savedUri: string | undefined = undefined;
+        let importedCover: image.PixelMap | undefined = undefined;
         try {
           if (item.audioUri === undefined || item.lyricUri === undefined) throw new Error('缺少音频或歌词授权 URI');
           const working = await AudioMetadataService.importToSandbox(item.audioUri, item.audioName, context.filesDir);
           sourceWorkingPath = working.workingPath;
+          importedCover = working.metadata.coverImage;
           const lyricText: string = await FileSelectionService.readUtf8Text(item.lyricUri);
           let embeddedLyrics: string = lyricText;
           const lowerLyricSource: string = item.lyricName.toLowerCase();
@@ -1090,7 +1101,7 @@ struct Index {
             if (converted.warnings.length > 0) failureNotes.push(item.audioName + '：' + converted.warnings.join('；'));
           }
           exportPath = await AudioMetadataService.makeWorkingCopy(sourceWorkingPath, context.filesDir, item.audioName);
-          await AudioMetadataService.write(exportPath, { lyrics: embeddedLyrics });
+          await AudioMetadataService.write(exportPath, { lyrics: embeddedLyrics }, context.filesDir);
           const baseName: string = AudioMetadataService.safeOutputName(item.audioName, working.metadata.title || item.audioTitle || item.audioName);
           const saved = await ExportService.saveAudioToDownload(context, baseName, exportPath);
           if (saved !== undefined) {
@@ -1104,6 +1115,7 @@ struct Index {
           failed++;
           failureNotes.push(item.audioName + '：' + (this.describeError(error)));
         } finally {
+          if (importedCover !== undefined) { try { await importedCover.release(); } catch (_error) {} }
           if (sourceWorkingPath.length > 0) await AudioMetadataService.removeWorkingFile(sourceWorkingPath);
           if (exportPath.length > 0) await AudioMetadataService.removeWorkingFile(exportPath);
         }
@@ -1442,8 +1454,8 @@ struct Index {
       Text('分组').fontSize(12).fontColor(MUTED).width('100%')
       TextInput({ text: this.grouping, placeholder: '分组' }).enabled(!this.busy).height(42).backgroundColor('#F5F7FB').borderRadius(12)
         .onChange((v: string) => { this.grouping = v; })
-      Text('ISRC').fontSize(12).fontColor(MUTED).width('100%')
-      TextInput({ text: this.isrc, placeholder: 'ISRC' }).enabled(!this.busy).height(42).backgroundColor('#F5F7FB').borderRadius(12)
+      Text(/\.m4a$/i.test(this.audioName) ? 'ISRC（M4A 暂不支持读取和编辑）' : 'ISRC').fontSize(12).fontColor(MUTED).width('100%')
+      TextInput({ text: this.isrc, placeholder: 'ISRC' }).enabled(!this.busy && !/\.m4a$/i.test(this.audioName)).height(42).backgroundColor('#F5F7FB').borderRadius(12)
         .onChange((v: string) => { this.isrc = v; })
       Text('版权信息').fontSize(12).fontColor(MUTED).width('100%')
       TextInput({ text: this.copyright, placeholder: '版权信息' }).enabled(!this.busy).height(42).backgroundColor('#F5F7FB').borderRadius(12)

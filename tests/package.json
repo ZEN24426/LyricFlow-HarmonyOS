@@ -1,0 +1,11 @@
+{
+  "name": "lyricflow-metadata-tests",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "test": "node test-independent-mp3-reader.cjs && node test-independent-mp3-roundtrip.cjs && node test-own-flac.cjs && node test-own-wav.cjs && node test-direct-preflight.cjs && node m4a-own.test.cjs && node test-m4a-export.cjs && node test-own-aiff.cjs && node test-system-audio-properties.cjs && node test-own-ogg.cjs && node test-own-ogg-repage.cjs && node test-own-adts.cjs && node test-adts-duration-policy.cjs"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3"
+  }
+}

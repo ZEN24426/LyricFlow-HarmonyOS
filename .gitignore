@@ -56,3 +56,6 @@ entry/.preview/
 *.hap
 *.app
 _pull_latest.ps1
+
+# Local test dependencies
+node_modules/
