@@ -61,7 +61,7 @@ export class AudioSaveService {
         request.workingPath, request.context.filesDir, request.sourceName
       );
       // An untouched fixed-layout format can be exported as an exact copy without rewriting metadata.
-      if (!/\.(m4a|aif|aiff|ogg|opus|aac)$/i.test(request.sourceName) || Object.keys(request.fields).length > 0) {
+      if (!/\.(m4a|aif|aiff|ogg|opus|aac|wma)$/i.test(request.sourceName) || Object.keys(request.fields).length > 0) {
         await AudioMetadataService.write(exportPath, request.fields, request.context.filesDir);
       } else if (!(await AudioMetadataService.filesIdentical(request.workingPath, exportPath))) {
         throw new Error('原样副本与工作音频不一致，已取消导出。');

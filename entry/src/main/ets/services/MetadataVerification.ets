@@ -110,7 +110,7 @@ async function assertCover(expected: image.PixelMap | undefined, actual: image.P
 }
 
 /** Throws on mismatched or unverifiable fields; never silently skips zero/empty. */
-export async function verifyWrittenMetadata(expected: AudioMetadataWriter, actual: AudioMetadata): Promise<void> {
+export async function verifyWrittenMetadata(expected: AudioMetadataWriter, actual: AudioMetadata, verifyCover: boolean = true): Promise<void> {
   assertText('标题', expected.title, actual.title);
   assertText('歌手', expected.artist, actual.artist);
   assertText('专辑', expected.album, actual.album);
@@ -128,7 +128,7 @@ export async function verifyWrittenMetadata(expected: AudioMetadataWriter, actua
   assertNumber('碟片总数', expected.discTotal, actual.discTotal);
   assertNumber('曲目总数', expected.trackTotal, actual.trackTotal);
   assertNumber('BPM', expected.bpm, actual.bpm);
-  await assertCover(expected.coverImage, actual.coverImage);
+  if (verifyCover) await assertCover(expected.coverImage, actual.coverImage);
 }
 
 function assertPreservedText(name: string, before: string, after: string): void {
@@ -153,7 +153,8 @@ export async function verifyPreservedMetadata(
   expected: AudioMetadataWriter,
   before: AudioMetadata,
   after: AudioMetadata,
-  verifyDuration: boolean = true
+  verifyDuration: boolean = true,
+  verifyCover: boolean = true
 ): Promise<void> {
   if (expected.title === undefined) assertPreservedText('标题', before.title, after.title);
   if (expected.artist === undefined) assertPreservedText('歌手', before.artist, after.artist);
@@ -172,7 +173,7 @@ export async function verifyPreservedMetadata(
   if (expected.discTotal === undefined) assertPreservedNumber('碟片总数', before.discTotal, after.discTotal);
   if (expected.trackTotal === undefined) assertPreservedNumber('曲目总数', before.trackTotal, after.trackTotal);
   if (expected.bpm === undefined) assertPreservedNumber('BPM', before.bpm, after.bpm);
-  if (expected.coverImage === undefined) {
+  if (verifyCover && expected.coverImage === undefined) {
     const beforeHasCover: boolean = before.coverImage !== undefined && before.coverImage !== null;
     const afterHasCover: boolean = after.coverImage !== undefined && after.coverImage !== null;
     if (!beforeHasCover && afterHasCover) {

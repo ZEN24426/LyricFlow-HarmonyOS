@@ -1,0 +1,11 @@
+const fs=require('node:fs'),path=require('node:path'),vm=require('node:vm'),assert=require('node:assert/strict'),{spawnSync}=require('node:child_process');
+const ts=require('typescript');
+function load(name,deps={}){let code=fs.readFileSync(path.join(__dirname,'../../entry/src/main/ets/services',name+'.ets'),'utf8'),js=ts.transpileModule(code,{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2020}}).outputText,m={exports:{}};vm.runInThisContext('(function(exports,module,require){'+js+'\n})')(m.exports,m,id=>deps[id]||{});return m.exports}
+class LocalSource{constructor(p){this.p=p;this.fd=fs.openSync(p,'r');this.max=0}size(){return fs.fstatSync(this.fd).size}snapshotToken(){let a=fs.fstatSync(this.fd,{bigint:true}),b=fs.statSync(this.p,{bigint:true});if(a.ino!==b.ino||a.size!==b.size||a.mtimeNs!==b.mtimeNs||a.ctimeNs!==b.ctimeNs)throw Error('identity changed');return [a.ino,a.size,a.mtimeNs,a.ctimeNs].join(':')}readAt(p,n){this.max=Math.max(this.max,n);let b=Buffer.alloc(Math.min(n,997)),count=fs.readSync(this.fd,b,0,b.length,p);return Uint8Array.from(b.subarray(0,count))}close(){fs.closeSync(this.fd)}}
+const ffprobe=process.env.ASF_TEST_FFPROBE;if(!ffprobe)throw Error('set ASF_TEST_FFPROBE');
+class FfprobeAudio{async inspect(s){let p=spawnSync(ffprobe,['-v','error','-show_entries','format=duration:stream=codec_type,channels,sample_rate','-of','json',s.p],{encoding:'utf8'});if(p.status!==0)throw Error(p.stderr);let x=JSON.parse(p.stdout),a=x.streams.filter(s=>s.codec_type==='audio');assert.equal(a.length,1);return {durationMs:Math.round(Number(x.format.duration)*1000),channels:a[0].channels,sampleRate:Number(a[0].sample_rate)}}}
+const verifyModule=load('AsfStagedIntegrity',{'./AsfHeaderEditor':load('AsfHeaderEditor'),'./AsfPrivateIO':{AsfPrivateSource:LocalSource},'./AsfSystemAudioProbe':{AsfSystemAudioProbe:FfprobeAudio}});
+const base=process.env.ASF_FIXTURE_DIR;
+verifyModule.verifyAsfStagedIntegrity(path.join(base,'wmav2-picture-padding.wma'),path.join(base,'editor-output.wma'),['Title']).then(()=>console.log('PASS real FFmpeg WMAv2 files: reopened local source/edited, bounded short reads, immutable header/data check, ffprobe properties')).catch(e=>{console.error(e);process.exitCode=1});
+
+

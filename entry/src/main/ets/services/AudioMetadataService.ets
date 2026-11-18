@@ -7,6 +7,8 @@ import { readM4aMetadata, writeM4aMetadata, verifyM4aIntegrity } from './OwnM4aM
 import { readAiffMetadata, writeAiffMetadata, verifyAiffIntegrity } from './OwnAiffMetadata';
 import { readOggMetadata, writeOggMetadata, verifyOggIntegrity } from './OwnOggMetadata';
 import { readAdtsMetadata, writeAdtsMetadata, verifyAdtsIntegrity } from './OwnAdtsMetadata';
+import { AsfMetadataReader } from './AsfMetadataReader';
+import { writeAsfWorkingCopy } from './AsfWorkingSave';
 import { fillAudioProperties } from './SystemAudioProperties';
 import { writeMp3MetadataCopy } from './Mp3DirectWriter';
 import { verifyWrittenMetadata, verifyPreservedMetadata } from './MetadataVerification';
@@ -23,13 +25,15 @@ async function readAudioMetadata(path: string, filesDir: string): Promise<AudioM
   else if (/\.(aif|aiff)$/i.test(path)) result = await readAiffMetadata(path, filesDir);
   else if (/\.(ogg|opus)$/i.test(path)) result = await readOggMetadata(path);
   else if (/\.aac$/i.test(path)) result = await readAdtsMetadata(path);
+  else if (/\.wma$/i.test(path)) result = await AsfMetadataReader.read(path);
   else throw new Error('此音频格式暂不支持独立标签读取，未修改文件。');
   try {
     // FLAC STREAMINFO contains sample count, rate and channels without estimating.
     // Unknown total samples still require the system extractor.
     const parsedRate: number = result.sampleRate;
     const parsedChannels: number = result.channels;
-    if (!/\.flac$/i.test(path) || result.durationMs <= 0) await fillAudioProperties(path, result);
+    // ASF reader already compares system properties with the audio stream header.
+    if (!/\.wma$/i.test(path) && (!/\.flac$/i.test(path) || result.durationMs <= 0)) await fillAudioProperties(path, result);
     if (/\.(ogg|opus)$/i.test(path) &&
         (result.channels !== parsedChannels || (result.fileType === 'audio/ogg' && result.sampleRate !== parsedRate))) {
       throw new Error('Ogg 音频头与系统识别的声道或采样率不一致。');
@@ -200,6 +204,7 @@ export class AudioMetadataService {
     if (!root.startsWith('/') || !workingPath.startsWith(root + '/') || root.indexOf('\\') >= 0 ||
         workingPath.indexOf('\\') >= 0 || segments.indexOf('..') >= 0 || segments.indexOf('.') >= 0 ||
         workingPath.indexOf('\u0000') >= 0) throw new Error('仅允许修改应用私有目录内的工作副本。');
+    if (/\.wma$/i.test(workingPath)) { await writeAsfWorkingCopy(root, workingPath, fields); return; }
     const before: AudioMetadata = await AudioMetadataService.readForDirect(workingPath, root);
     let after: AudioMetadata | undefined = undefined;
     let staged: string = '';
@@ -221,7 +226,8 @@ export class AudioMetadataService {
       else if (/\.m4a$/i.test(workingPath)) await verifyM4aIntegrity(workingPath, staged, fields);
       else if (/\.(aif|aiff)$/i.test(workingPath)) await verifyAiffIntegrity(workingPath, staged);
       else if (/\.(ogg|opus)$/i.test(workingPath)) await verifyOggIntegrity(workingPath, staged, fields);
-      else await verifyAdtsIntegrity(root, workingPath, staged, fields);
+      else if (/\.aac$/i.test(workingPath)) await verifyAdtsIntegrity(root, workingPath, staged, fields);
+      else throw new Error('未知格式，无法校验输出。');
       fileIo.renameSync(staged, workingPath);
     } finally {
       if (before.coverImage !== undefined) { try { await before.coverImage.release(); } catch (_error) {} }

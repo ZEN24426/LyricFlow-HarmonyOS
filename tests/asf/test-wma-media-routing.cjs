@@ -1,0 +1,7 @@
+const fs=require('node:fs'),vm=require('node:vm'),assert=require('node:assert/strict'),ts=require('typescript');
+const file=require('node:path').join(__dirname,'../../entry/src/main/ets/services/AudioMetadataService.ets');
+const js=ts.transpileModule(fs.readFileSync(file,'utf8'),{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2020}}).outputText;let fill=0,asf=0,fail=false;
+const expected={durationMs:1000,duration:1,sampleRate:44100,channels:1,fileType:'audio/x-ms-wma'};
+const deps={'@kit.CoreFileKit':{fileIo:{},fileUri:{}},'./AsfMetadataReader':{AsfMetadataReader:{async read(){asf++;if(fail)throw Error('invalid ASF media');return {...expected}}}},'./SystemAudioProperties':{async fillAudioProperties(){fill++}},'./Mp3MetadataReader':{async readMp3Metadata(){return {...expected}}}};
+const m={exports:{}};vm.runInThisContext('(function(exports,module,require){'+js+'\n})')(m.exports,m,id=>deps[id]||{});
+(async()=>{let result=await m.exports.AudioMetadataService.read('/private/fixture.wma','/private');assert.equal(result.durationMs,1000);assert.equal(asf,1);assert.equal(fill,0);await m.exports.AudioMetadataService.read('/private/fixture.mp3','/private');assert.equal(fill,1);fail=true;await assert.rejects(()=>m.exports.AudioMetadataService.read('/private/fixture.wma','/private'),/invalid ASF media/);assert.equal(fill,1);console.log('PASS mocked app read routing: WMA uses its validated system probe, errors propagate; MP3 behavior unchanged')})().catch(e=>{console.error(e);process.exitCode=1});

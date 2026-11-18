@@ -459,7 +459,9 @@ struct Index {
         await AudioMetadataService.removeWorkingFile(previousPath);
       }
       // 成功提示仅短暂显示，不占用底部的持久状态栏。
-      if (/\.(ogg|opus)$/i.test(selected.name)) {
+      if (/\.wma$/i.test(selected.name)) {
+        this.notify('WMA 仅支持部分文件的副本导出；标签空间不足或结构不受支持时会拒绝。');
+      } else if (/\.(ogg|opus)$/i.test(selected.name)) {
         this.notify('OGG/OPUS 目前仅支持部分单流文件的副本导出，暂不支持更换封面。');
       } else {
         this.getUIContext().getPromptAction().showToast({ message: '已成功读取音频元数据', duration: 2000 });
@@ -735,7 +737,7 @@ struct Index {
     this.busy = true;
     this.notify('');
     try {
-      const prepared: PreparedAudioMetadata = await this.prepareAudioMetadata(/\.(m4a|aif|aiff|ogg|opus|aac)$/i.test(this.audioName));
+      const prepared: PreparedAudioMetadata = await this.prepareAudioMetadata(/\.(m4a|aif|aiff|ogg|opus|aac|wma)$/i.test(this.audioName));
       const saved = await AudioSaveService.save('exportCopy', {
         context: this.ctx(),
         sourceUri: this.audioUri,
