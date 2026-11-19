@@ -41,6 +41,19 @@ function syncBackupDirectory(path: string): void {
 }
 
 export class ExportService {
+  // Process-local ordinary export gate. Picker URIs can alias local/provider paths;
+  // without a trustworthy canonical directory identity, one service-wide gate is
+  // the narrowest safe scope. This is NOT cross-process filesystem exclusion.
+  private static exportTail: Promise<void> = Promise.resolve();
+
+  private static async serializedExport<T>(operation: () => Promise<T>): Promise<T> {
+    const previous: Promise<void> = ExportService.exportTail;
+    let release: () => void = () => {};
+    ExportService.exportTail = new Promise<void>((resolve) => { release = resolve; });
+    await previous;
+    try { return await operation(); } finally { release(); }
+  }
+
 
   // ── 公共 API ──
 
@@ -61,9 +74,11 @@ export class ExportService {
       const dirUri: string | undefined = await ExportService.getDownloadDirUri(context);
       if (dirUri === undefined) return undefined;
       try {
-        const output = ExportService.uniqueExportTarget(dirUri, fileName);
-        await ExportService.writeBytes(output.path, data, total);
-        return { name: output.name, uri: output.path, size: total } as SavedExport;
+        return await ExportService.serializedExport<SavedExport>(async () => {
+          const output = ExportService.uniqueExportTarget(dirUri, fileName);
+          await ExportService.writeBytes(output.path, data, total);
+          return { name: output.name, uri: output.path, size: total } as SavedExport;
+        });
       } catch (error) {
         if (attempt === 0 && ExportService.isAccessRelatedError(error)) continue;
         throw error as Error;
@@ -87,9 +102,11 @@ export class ExportService {
       const dirUri: string | undefined = await ExportService.getDownloadDirUri(context);
       if (dirUri === undefined) return undefined;
       try {
-        const output = ExportService.uniqueExportTarget(dirUri, fileName);
-        await ExportService.streamCopy(sourcePath, output.path, totalSize, onProgress);
-        return { name: output.name, uri: output.path, size: totalSize } as SavedExport;
+        return await ExportService.serializedExport<SavedExport>(async () => {
+          const output = ExportService.uniqueExportTarget(dirUri, fileName);
+          await ExportService.streamCopy(sourcePath, output.path, totalSize, onProgress);
+          return { name: output.name, uri: output.path, size: totalSize } as SavedExport;
+        });
       } catch (error) {
         if (attempt === 0 && ExportService.isAccessRelatedError(error)) continue;
         throw error as Error;
@@ -195,10 +212,13 @@ export class ExportService {
       const name: string = fileNames[i];
       const sourcePath: string = sandboxDir + '/' + name;
       try {
-        const output = ExportService.uniqueExportTarget(dirUri, name);
-        const totalSize: number = fileIo.statSync(sourcePath).size;
-        await ExportService.streamCopy(sourcePath, output.path, totalSize);
-        copied.push(output.name);
+        const savedName: string = await ExportService.serializedExport<string>(async () => {
+          const output = ExportService.uniqueExportTarget(dirUri, name);
+          const totalSize: number = fileIo.statSync(sourcePath).size;
+          await ExportService.streamCopy(sourcePath, output.path, totalSize);
+          return output.name;
+        });
+        copied.push(savedName);
       } catch (_) {
         failed.push(name);
       }
@@ -316,7 +336,8 @@ export class ExportService {
       }
       await ExportService.verifyBytes(target, data, totalSize);
     } catch (error) {
-      try { fileIo.unlinkSync(target); } catch (_cleanupError) {}
+      // Keep uncertain partial output: CREATE is not exclusive and a provider
+      // may replace this path. Never unlink a path whose ownership is unproven.
       throw error as Error;
     }
   }
@@ -376,7 +397,8 @@ export class ExportService {
       // 仅在本次确实成功打开目标之后才清理；open 自身抛错时不可误删。
       // 仍需注意外部进程同时创建同名文件的竞争窗口（非原子创建）。
       if (targetOpened && cleanupOnFailure) {
-        try { fileIo.unlinkSync(target); } catch (_cleanupError) {}
+        // Keep uncertain partial output: CREATE is not exclusive and a provider
+      // may replace this path. Never unlink a path whose ownership is unproven.
       }
       throw error as Error;
     } finally {

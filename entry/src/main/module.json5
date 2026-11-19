@@ -6,6 +6,9 @@
     "mainElement": "EntryAbility",
     "requestPermissions": [
       {
+        "name": "ohos.permission.INTERNET"
+      },
+      {
         "name": "ohos.permission.FILE_ACCESS_PERSIST",
         "reason": "$string:folder_permission_reason",
         "usedScene": {

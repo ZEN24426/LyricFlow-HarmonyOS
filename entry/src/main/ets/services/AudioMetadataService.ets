@@ -75,7 +75,8 @@ function extensionOf(name: string): string {
 async function copyFileByUri(
   sourceUri: string,
   destinationPath: string,
-  onDestinationReady?: () => void
+  onDestinationReady?: () => void,
+  onDestinationOpened?: () => void
 ): Promise<void> {
   // Reject obvious aliases before opening either destination or truncating it.
   let sourceKey: string = sourceUri;
@@ -96,6 +97,7 @@ async function copyFileByUri(
     // Do not truncate during open: two different URIs or paths may identify the
     // same file. Check the opened handles first, then truncate the same handle.
     destination = await fileIo.open(destinationPath, fileIo.OpenMode.CREATE | fileIo.OpenMode.WRITE_ONLY);
+    if (onDestinationOpened !== undefined) onDestinationOpened();
     const sourceInode: string = fileIo.statSync(source.fd).ino.toString();
     const destinationInode: string = fileIo.statSync(destination.fd).ino.toString();
     // The SDK exposes ino but not a device ID. Reject ambiguous zero IDs and
@@ -107,19 +109,22 @@ async function copyFileByUri(
     if (onDestinationReady !== undefined) onDestinationReady();
     fileIo.truncateSync(destination.fd, 0);
     const bufferSize: number = 1024 * 1024;
+    // Reuse the buffer after the preceding async write has completed.
+    const buffer: ArrayBuffer = new ArrayBuffer(bufferSize);
     while (true) {
-      const buffer: ArrayBuffer = new ArrayBuffer(bufferSize);
       const count: number = await fileIo.read(source.fd, buffer, { length: bufferSize });
       if (count <= 0) break;
       let offset: number = 0;
       while (offset < count) {
-        const view: ArrayBuffer = buffer.slice(offset, count);
+        // The write length excludes any unused bytes in the last read.
+        const view: ArrayBuffer = offset === 0 ? buffer : buffer.slice(offset, count);
         const written: number = await fileIo.write(destination.fd, view, { length: count - offset });
         if (written <= 0) throw new Error('复制文件时写入失败。');
         offset += written;
       }
     }
-    fileIo.fsyncSync(destination.fd);
+    // Preserve durability and wait for the flush without blocking the UI thread.
+    await fileIo.fsync(destination.fd);
   } finally {
     try { fileIo.closeSync(source.fd); } catch (_error) {}
     if (destination !== undefined) {
@@ -128,22 +133,34 @@ async function copyFileByUri(
   }
 }
 
+/** The private copy could remain on disk; its contents have not been modified. */
+export class WorkingFileCleanupError extends Error {
+  constructor() { super('临时音频副本未能清理，请检查应用存储并稍后重启应用。'); }
+}
+
 export class AudioMetadataService {
   static async importToSandbox(
     sourceUri: string,
     sourceName: string,
-    filesDir: string
+    filesDir: string,
+    strictCleanup: boolean = false
   ): Promise<WorkingAudio> {
     const workingPath: string = (filesDir.endsWith('/') ? filesDir.substring(0, filesDir.length - 1) : filesDir) + '/lyricflow_work_' +
       Date.now().toString() + '_' + Math.random().toString(36).slice(2, 10) + extensionOf(sourceName);
     let canCleanWorkingPath: boolean = false;
+    let destinationOpened: boolean = false;
     try {
-      await copyFileByUri(sourceUri, workingPath, () => { canCleanWorkingPath = true; });
+      await copyFileByUri(sourceUri, workingPath, () => { canCleanWorkingPath = true; },
+        () => { destinationOpened = true; });
       const metadata: AudioMetadata = await AudioMetadataService.readForDirect(workingPath, filesDir, false);
       return { sourceUri, sourceName, workingPath, metadata };
     } catch (error) {
       if (canCleanWorkingPath) {
-        try { fileIo.unlinkSync(workingPath); } catch (_unlinkError) {}
+        try { fileIo.unlinkSync(workingPath); }
+        catch (_unlinkError) { if (strictCleanup) throw new WorkingFileCleanupError(); }
+      } else if (strictCleanup && destinationOpened) {
+        // Identity was not established, so deleting the opened path is unsafe.
+        throw new WorkingFileCleanupError();
       }
       throw error as Error;
     }
@@ -173,7 +190,8 @@ export class AudioMetadataService {
     sourceName: string,
     filesDir: string,
     allowSandboxCopy: boolean = true,
-    onSandboxCopyAttempt?: () => void
+    onSandboxCopyAttempt?: () => void,
+    strictCleanup: boolean = false
   ): Promise<MatchingMetadataRead> {
     let sourcePath: string = '';
     try { sourcePath = new fileUri.FileUri(sourceUri).path; } catch (_error) {}
@@ -189,11 +207,21 @@ export class AudioMetadataService {
     if (!allowSandboxCopy) throw new Error('此文件 URI 不能直接用于标签读取，且本轮已达到沙箱副本读取上限。');
     // 在真正开始全文件复制前就计入预算，失败的文件也不能无限重试。
     if (onSandboxCopyAttempt !== undefined) onSandboxCopyAttempt();
-    const working = await AudioMetadataService.importToSandbox(sourceUri, sourceName, filesDir);
+    const working = await AudioMetadataService.importToSandbox(sourceUri, sourceName, filesDir, strictCleanup);
     try {
       return { metadata: working.metadata, usedSandboxCopy: true };
     } finally {
-      await AudioMetadataService.removeWorkingFile(working.workingPath);
+      if (strictCleanup) {
+        try { await AudioMetadataService.removeWorkingFileChecked(working.workingPath); }
+        catch (error) {
+          if (working.metadata.coverImage !== undefined) {
+            try { await working.metadata.coverImage.release(); } catch (_releaseError) {}
+          }
+          throw error as Error;
+        }
+      } else {
+        await AudioMetadataService.removeWorkingFile(working.workingPath);
+      }
     }
   }
 
@@ -305,6 +333,11 @@ export class AudioMetadataService {
 
   static async removeWorkingFile(path: string): Promise<void> {
     try { fileIo.unlinkSync(path); } catch (_error) {}
+  }
+
+  /** Explicit cleanup result for flows which need to report retained copies. */
+  static async removeWorkingFileChecked(path: string): Promise<void> {
+    try { fileIo.unlinkSync(path); } catch (_error) { throw new WorkingFileCleanupError(); }
   }
 
   static async cleanupTemporaryFiles(filesDir: string): Promise<void> {

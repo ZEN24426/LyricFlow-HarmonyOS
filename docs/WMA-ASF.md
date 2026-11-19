@@ -18,8 +18,8 @@
 
 ## 验证范围
 
-在独立调试应用及一台 nova 14 Ultra 上，使用合成且带预留空间的 WMA 验证导入、修改标题后导出并重选读回，以及修改歌词后导出并读回。所选合成 PNG 报告 CUSTOM 色域并安全拒绝；封面写入没有真机成功证据。候选工程本身尚未在设备上安装或验证。模拟 I/O、MediaKit 和 ImageKit 测试不能替代系统实测；FFmpeg 测试不能证明 HarmonyOS 解码器行为。
+旧版去依赖修复在独立调试应用及一台 nova 14 Ultra 上，使用合成且带预留空间的 WMA 验证导入、修改标题后导出并重选读回，以及修改歌词后导出并读回。所选合成 PNG 报告 CUSTOM 色域并安全拒绝；封面写入没有真机成功证据。合入云端功能后的本开发版还需独立构建和真机回归。模拟 I/O、MediaKit 和 ImageKit 测试不能替代系统实测；FFmpeg 测试不能证明 HarmonyOS 解码器行为。
 
 ## 可复现验证
 
-在 `tests` 目录运行 `npm ci` 后，按 [测试说明](../tests/asf/README.md) 设置 FFmpeg 和 FFprobe 路径，再运行 `npm run test:asf`。该脚本在系统临时目录生成合成样本，运行 15 项 ASF 测试并清理样本；异常中断可能留下临时目录。其他格式的既有回归在 `tests` 目录运行 `npm test`，该命令不包含 ASF 测试。ArkTS 编译在仓库根目录运行 `devecocli build --modules entry --build-mode debug`。候选未配置签名，构建结果不能直接作为已签名安装包。
+在 `tests` 目录运行 `npm ci` 后，按 [测试说明](../tests/asf/README.md) 设置 FFmpeg 和 FFprobe 路径，再运行 `npm run test:asf`。该脚本在系统临时目录生成合成样本并运行 ASF 测试；异常中断可能留下临时目录。其他格式及云端测试的执行命令以 `tests/package.json` 为准。ArkTS 编译在仓库根目录运行 `devecocli build --modules entry --build-mode debug`。仓库未配置签名，构建结果不能直接作为已签名安装包。

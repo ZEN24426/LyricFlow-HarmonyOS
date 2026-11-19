@@ -9,6 +9,7 @@
 .hvigor/
 build/
 oh_modules/
+node_modules/
 entry/build/
 entry/oh_modules/
 
@@ -56,6 +57,3 @@ entry/.preview/
 *.hap
 *.app
 _pull_latest.ps1
-
-# Local test dependencies
-node_modules/

@@ -17,6 +17,8 @@ export interface LyricDocument {
   metadata: Record<string, string>;
   lines: LyricLine[];
   warnings: string[];
+  /** A parsed subtitle had malformed events that could otherwise be silently dropped. */
+  conversionBlocked?: boolean;
 }
 
 export interface LrcExportResult {
@@ -65,10 +67,68 @@ function makeLineText(lines: string[], startIndex: number): string {
   for (let i: number = startIndex; i < lines.length; i++) {
     const value: string = lines[i].trim();
     if (value.length === 0) break;
-    if (value.indexOf('-->') >= 0) break;
+    if (subtitleCue(value) !== undefined) break;
     parts.push(value);
   }
   return parts.join(' ');
+}
+
+interface SubtitleCue {
+  startMs: number;
+  endMs: number;
+}
+
+/** A bare arrow in lyric text is not a subtitle cue. */
+function subtitleCue(row: string): SubtitleCue | undefined {
+  const match: RegExpMatchArray | null = row.match(/^\s*((?:\d+:)?\d{1,2}:\d{2}(?:[.,]\d{1,3})?)\s*-->\s*((?:\d+:)?\d{1,2}:\d{2}(?:[.,]\d{1,3})?)(?:\s+[^\r\n]*)?\s*$/);
+  if (match === null || row.indexOf('-->') !== row.lastIndexOf('-->')) return undefined;
+  for (let i: number = 1; i <= 2; i++) {
+    const parts: string[] = match[i].replace(',', '.').split(':');
+    const seconds: number = Number(parts[parts.length - 1].split('.')[0]);
+    if (seconds >= 60 || (parts.length === 3 && Number(parts[1]) >= 60)) return undefined;
+  }
+  const start: number | undefined = parseTimestamp(match[1]);
+  const end: number | undefined = parseTimestamp(match[2]);
+  if (start === undefined || end === undefined || !Number.isSafeInteger(start) ||
+      !Number.isSafeInteger(end) || end < start) return undefined;
+  return { startMs: start, endMs: end };
+}
+
+function looksLikeSubtitleCue(row: string): boolean {
+  return (/^\s*\d+:\d/.test(row) && /(?:-->|->|→)/.test(row)) ||
+    (/-->/.test(row) && /-->\s*\d+:\d/.test(row));
+}
+
+function malformedCueAt(rows: string[], index: number): boolean {
+  const row: string = rows[index].trim();
+  if (looksLikeSubtitleCue(row)) return true;
+  const prior: string = index > 0 ? rows[index - 1].trim() : '';
+  const beforePrior: string = index > 1 ? rows[index - 2].trim() : '';
+  const atBlockStart: boolean = index === 0 || prior.length === 0;
+  const afterIdentifier: boolean = prior.length > 0 && subtitleCue(prior) === undefined &&
+    (index === 1 || beforePrior.length === 0);
+  return (atBlockStart || afterIdentifier) &&
+    (row.indexOf('-->') >= 0 || /^\d+:\d/.test(row));
+}
+
+function firstSubtitleCue(source: string): number {
+  const rows: string[] = source.split('\n');
+  let offset: number = 0;
+  for (let i: number = 0; i < rows.length; i++) {
+    if (subtitleCue(rows[i]) !== undefined || looksLikeSubtitleCue(rows[i])) return offset;
+    offset += rows[i].length + 1;
+  }
+  return -1;
+}
+
+function firstSbvCue(source: string): number {
+  const rows: string[] = source.split('\n');
+  let offset: number = 0;
+  for (let i: number = 0; i < rows.length; i++) {
+    if (/^\s*((?:\d+:)?\d+:\d+\.\d+),((?:\d+:)?\d+:\d+\.\d+)\s*$/.test(rows[i])) return offset;
+    offset += rows[i].length + 1;
+  }
+  return -1;
 }
 
 function parseEnhancedSegments(text: string): LyricSegment[] {
@@ -101,7 +161,7 @@ function parseLrc(source: string): LyricDocument {
   const lines: LyricLine[] = [];
   let hasEnhanced: boolean = false;
   const rows: string[] = source.split(/\r?\n/);
-  const timePattern: RegExp = /\[(\d{1,2}:\d{2}(?:[.:]\d{1,3})?)\]/g;
+  const timePattern: RegExp = /\[(\d{1,3}:\d{2}(?:[.:]\d{1,3})?)\]/g;
   for (let i: number = 0; i < rows.length; i++) {
     const row: string = rows[i].trim();
     if (row.length === 0) continue;
@@ -146,20 +206,43 @@ function parseLrc(source: string): LyricDocument {
 function parseSubRipOrVtt(source: string, format: 'srt' | 'vtt'): LyricDocument {
   const rows: string[] = source.replace(/\r/g, '').split('\n');
   const lines: LyricLine[] = [];
+  // Track every nonempty input row accounted for by a cue, its optional
+  // identifier, or the VTT signature. Otherwise a separate LRC/plain block
+  // can silently disappear when this document is converted.
+  const consumed: boolean[] = rows.map((_row: string): boolean => false);
+  let malformed: boolean = false;
+  if (format === 'vtt' && rows.length > 0 && /^WEBVTT(?:[ \t].*)?$/.test(rows[0].trim())) consumed[0] = true;
   for (let i: number = 0; i < rows.length; i++) {
     const row: string = rows[i].trim();
-    if (row.indexOf('-->') < 0) continue;
-    const timing: string[] = row.split('-->');
-    const startMs: number | undefined = parseTimestamp(timing[0].trim().split(' ')[0]);
-    const endMs: number | undefined = timing.length > 1 ?
-      parseTimestamp(timing[1].trim().split(' ')[0]) : undefined;
+    const cue: SubtitleCue | undefined = subtitleCue(row);
+    if (cue === undefined) {
+      if (malformedCueAt(rows, i)) malformed = true;
+      continue;
+    }
+    consumed[i] = true;
+    // SRT uses numeric sequence numbers; WebVTT permits an arbitrary single
+    // cue identifier. A standalone LRC line is never treated as an identifier.
+    if (i > 0 && rows[i - 1].trim().length > 0 && (i === 1 || rows[i - 2].trim().length === 0)) {
+      const identifier: string = rows[i - 1].trim();
+      if ((format === 'vtt' || /^\d+$/.test(identifier)) &&
+          !/^\[\s*[+-]?\d+[:.,]/.test(identifier) && identifier.indexOf('-->') < 0) consumed[i - 1] = true;
+    }
+    for (let j: number = i + 1; j < rows.length; j++) {
+      if (rows[j].trim().length === 0 || subtitleCue(rows[j]) !== undefined) break;
+      consumed[j] = true;
+    }
     let text: string = makeLineText(rows, i + 1);
+    // A time-like inline marker may carry word timing or be literal text;
+    // the generic subtitle tag stripper cannot safely decide which.
+    if (/<\s*[+-]?\d+\s*[:.,]/.test(text)) malformed = true;
     text = text.replace(/<[^>]+>/g, '').trim();
-    if (startMs !== undefined && text.length > 0) {
-      const line: LyricLine = { startMs, text };
-      if (endMs !== undefined) line.endMs = endMs;
+    if (text.length > 0) {
+      const line: LyricLine = { startMs: cue.startMs, endMs: cue.endMs, text };
       lines.push(line);
     }
+  }
+  for (let i: number = 0; i < rows.length; i++) {
+    if (rows[i].trim().length > 0 && !consumed[i]) malformed = true;
   }
   lines.sort((a: LyricLine, b: LyricLine) =>
     (a.startMs === undefined ? 0 : a.startMs) - (b.startMs === undefined ? 0 : b.startMs));
@@ -167,31 +250,66 @@ function parseSubRipOrVtt(source: string, format: 'srt' | 'vtt'): LyricDocument 
     format,
     metadata: {},
     lines,
-    warnings: ['转为 LRC 时字幕样式、位置及部分格式控制信息无法保留']
+    warnings: malformed ? ['字幕包含未识别内容或无效时间，已禁止转换以免丢失内容'] :
+      ['转为 LRC 时字幕样式、位置及部分格式控制信息无法保留'],
+    conversionBlocked: malformed
   };
+}
+
+function safeSubtitleTime(value: string): number | undefined {
+  const normalized: string = value.trim().replace(',', '.');
+  if (!/^\d+(?::\d+){1,2}(?:\.\d+)?$/.test(normalized)) return undefined;
+  const parts: string[] = normalized.split(':');
+  const seconds: number = Number(parts[parts.length - 1].split('.')[0]);
+  if (seconds >= 60 || (parts.length === 3 && Number(parts[1]) >= 60)) return undefined;
+  const result: number | undefined = parseTimestamp(normalized);
+  return result !== undefined && Number.isSafeInteger(result) ? result : undefined;
 }
 
 function parseSbv(source: string): LyricDocument {
   const rows: string[] = source.replace(/\r/g, '').split('\n');
   const lines: LyricLine[] = [];
+  const consumed: boolean[] = rows.map((_row: string): boolean => false);
+  let malformed: boolean = false;
   for (let i: number = 0; i < rows.length; i++) {
     const row: string = rows[i].trim();
     const timing: RegExpMatchArray | null = row.match(/^((?:\d+:)?\d+:\d+\.\d+),((?:\d+:)?\d+:\d+\.\d+)$/);
-    if (timing === null || timing.length < 3) continue;
-    const startMs: number | undefined = parseTimestamp(timing[1]);
-    const endMs: number | undefined = parseTimestamp(timing[2]);
-    const text: string = makeLineText(rows, i + 1);
+    if (timing === null || timing.length < 3) {
+      // An isolated malformed cue is rejected below as an unconsumed row.
+      // Do not mistake time-like words within a valid cue for another cue.
+      continue;
+    }
+    const startMs: number | undefined = safeSubtitleTime(timing[1]);
+    const endMs: number | undefined = safeSubtitleTime(timing[2]);
+    if (startMs === undefined || endMs === undefined || endMs < startMs) {
+      malformed = true;
+      continue;
+    }
+    consumed[i] = true;
+    const body: string[] = [];
+    for (let j: number = i + 1; j < rows.length; j++) {
+      const value: string = rows[j].trim();
+      if (value.length === 0 || /^((?:\d+:)?\d+:\d+\.\d+),((?:\d+:)?\d+:\d+\.\d+)$/.test(value)) break;
+      consumed[j] = true;
+      body.push(value);
+    }
+    const text: string = body.join(' ');
     if (startMs !== undefined && text.length > 0) {
       const line: LyricLine = { startMs, text };
       if (endMs !== undefined) line.endMs = endMs;
       lines.push(line);
     }
   }
+  for (let i: number = 0; i < rows.length; i++) {
+    if (rows[i].trim().length > 0 && !consumed[i]) malformed = true;
+  }
   return {
     format: 'sbv',
     metadata: {},
     lines,
-    warnings: ['SBV 的结束时间将不会写入标准 LRC']
+    warnings: malformed ? ['SBV 包含未识别内容或无效时间，已禁止转换以免丢失内容'] :
+      ['SBV 的结束时间将不会写入标准 LRC'],
+    conversionBlocked: malformed
   };
 }
 
@@ -203,8 +321,12 @@ function parseAss(source: string): LyricDocument {
   let endColumn: number = 2;
   let textColumn: number = 9;
   let expectedColumns: number = 10;
+  let malformed: boolean = false;
   for (let i: number = 0; i < rows.length; i++) {
     const row: string = rows[i].trim();
+    // Standalone LRC-timed rows mixed with ASS dialogue would otherwise be
+    // ignored by the subtitle parser, losing text during conversion.
+    if (/^\[\d{1,3}:\d{2}(?:[.:]\d{1,3})?\]/.test(row)) malformed = true;
     if (row.startsWith('[') && row.endsWith(']')) {
       inEvents = row.toLowerCase() === '[events]';
       continue;
@@ -219,13 +341,13 @@ function parseAss(source: string): LyricDocument {
         endColumn = end;
         textColumn = text;
         expectedColumns = columns.length;
-      }
+      } else malformed = true;
       continue;
     }
     if (!/^dialogue:/i.test(row)) continue;
     const body: string = row.substring(row.indexOf(':') + 1).trim();
     const fragments: string[] = body.split(',');
-    if (fragments.length < expectedColumns) continue;
+    if (fragments.length < expectedColumns) { malformed = true; continue; }
     // ASS 的 Text 字段可能包含逗号；即使 Format 声明中 Text 不是最后一列，
     // 也能按前后固定字段数正确拼回文本，而不是悄悄跳过整条字幕。
     const suffixCount: number = expectedColumns - textColumn - 1;
@@ -235,8 +357,9 @@ function parseAss(source: string): LyricDocument {
     for (let j: number = textEnd; j < fragments.length; j++) {
       fields.push(fragments[j]);
     }
-    const startMs: number | undefined = parseTimestamp(fields[startColumn].trim());
-    const endMs: number | undefined = parseTimestamp(fields[endColumn].trim());
+    const startMs: number | undefined = safeSubtitleTime(fields[startColumn].trim());
+    const endMs: number | undefined = safeSubtitleTime(fields[endColumn].trim());
+    if (startMs === undefined || endMs === undefined || endMs < startMs) { malformed = true; continue; }
     const text: string = decodeEntities(fields[textColumn])
       .replace(/\{[^}]*\}/g, '').replace(/\\N/g, '\n').replace(/\\n/g, '\n').trim();
     if (startMs !== undefined && text.length > 0) {
@@ -249,7 +372,9 @@ function parseAss(source: string): LyricDocument {
     format: 'ass',
     metadata: {},
     lines,
-    warnings: ['ASS/SSA 的起止时间和文本会被提取，但样式、说话人、卡拉 OK 效果和定位信息不会完整保留']
+    warnings: malformed ? ['ASS/SSA 包含未识别内容或无效时间，已禁止转换以免丢失内容'] :
+      ['ASS/SSA 的起止时间和文本会被提取，但样式、说话人、卡拉 OK 效果和定位信息不会完整保留'],
+    conversionBlocked: malformed
   };
 }
 
@@ -262,19 +387,24 @@ export class LyricEngine {
       return { format: 'unknown', metadata: {}, lines: [], warnings: ['歌词内容为空'] };
     }
 
-    if (lowerName.endsWith('.ass') || lowerName.endsWith('.ssa') ||
-        /^\s*\[Script Info\]/im.test(trimmed) || /^\s*Dialogue:/im.test(trimmed)) {
-      return parseAss(source);
+    // Explicit extensions are authoritative; a subtitle's text can itself contain LRC-looking tags.
+    if (lowerName.endsWith('.lrc')) return parseLrc(source);
+    if (lowerName.endsWith('.ass') || lowerName.endsWith('.ssa')) return parseAss(source);
+    if (lowerName.endsWith('.vtt') || lowerName.endsWith('.srt')) {
+      return parseSubRipOrVtt(source, lowerName.endsWith('.vtt') ? 'vtt' : 'srt');
     }
-    if (lowerName.endsWith('.vtt') || /^WEBVTT\b/im.test(trimmed) || /-->/.test(trimmed)) {
-      return parseSubRipOrVtt(source, lowerName.endsWith('.vtt') || /^WEBVTT\b/im.test(trimmed) ? 'vtt' : 'srt');
-    }
-    if (lowerName.endsWith('.sbv') || /^\d{1,2}:\d{2}:\d{2}\.\d+,\d{1,2}:\d{2}:\d{2}\.\d+/m.test(trimmed)) {
-      return parseSbv(source);
-    }
-    if (lowerName.endsWith('.lrc') || /^\s*\[\d{1,2}:\d{2}(?:[.:]\d{1,3})?\]/m.test(trimmed)) {
-      return parseLrc(source);
-    }
+    if (lowerName.endsWith('.sbv')) return parseSbv(source);
+    if (/^\s*\[Script Info\]/im.test(trimmed) || /^\s*Dialogue:/im.test(trimmed)) return parseAss(source);
+    if (/^WEBVTT\b/i.test(trimmed)) return parseSubRipOrVtt(source, 'vtt');
+    // For extensionless text, use the first structural cue. A later LRC-like
+    // string inside an SRT subtitle must not reclassify the entire document.
+    const lrcMatch: RegExpExecArray | null = /^\s*\[\d{1,3}:\d{2}(?:[.:]\d{1,3})?\]/m.exec(source);
+    const lrcAt: number = lrcMatch === null ? -1 : lrcMatch.index;
+    const subtitleAt: number = firstSubtitleCue(source);
+    const sbvAt: number = firstSbvCue(source);
+    if (lrcAt >= 0 && (subtitleAt < 0 || lrcAt < subtitleAt) && (sbvAt < 0 || lrcAt < sbvAt)) return parseLrc(source);
+    if (subtitleAt >= 0 && (sbvAt < 0 || subtitleAt <= sbvAt)) return parseSubRipOrVtt(source, 'srt');
+    if (sbvAt >= 0) return parseSbv(source);
     const plainLines: LyricLine[] = [];
     const rows: string[] = source.split('\n');
     for (let i: number = 0; i < rows.length; i++) {
@@ -288,6 +418,7 @@ export class LyricEngine {
   }
 
   static toLrc(document: LyricDocument): LrcExportResult {
+    if (document.conversionBlocked === true) throw new Error('字幕存在未识别内容或无效时间，已停止转换，避免丢失内容。');
     const warnings: string[] = document.warnings.slice();
     if (document.format === 'ass' ||
         document.format === 'srt' || document.format === 'vtt' || document.format === 'sbv') {

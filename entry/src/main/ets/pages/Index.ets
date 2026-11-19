@@ -1,9 +1,10 @@
+import { AboutPage } from '../components/AboutPage';
 import { common } from '@kit.AbilityKit';
 import { FileSelectionService, SelectedDocument } from '../services/FileSelectionService';
 import { FolderScanner, FolderScanResult } from '../services/FolderScanner';
 import { AudioMatchInput, LyricMatchInput, MatchCandidate, MatchReviewState } from '../services/MatchEngine';
 import { LyricDocument } from '../services/LyricEngine';
-import { AudioMetadataService } from '../services/AudioMetadataService';
+import { AudioMetadataService, WorkingAudio } from '../services/AudioMetadataService';
 import { AudioSaveService } from '../services/AudioSaveService';
 import { DirectAudioWriteService } from '../services/DirectAudioWriteService';
 import { PendingDirectWrite, getPendingDirectWrite, acknowledgeDirectWrite } from '../services/DirectWriteJournal';
@@ -17,6 +18,12 @@ import { AudioMetadataWriter } from '../services/AudioMetadataTypes';
 import { image } from '@kit.ImageKit';
 import { pasteboard } from '@kit.BasicServicesKit';
 import { preferences } from '@kit.ArkData';
+import { CloudLyricsPage, CloudLyricsSelection } from '../components/CloudLyricsPage';
+import { hasInlineLrcTiming, plainLrcFromEnhanced } from '../services/LrcPreservingExport';
+import { LyricTimingPage, LyricTimingResult } from '../components/LyricTimingPage';
+import { MissingLyricsPage, MissingLyricsSelection } from '../components/MissingLyricsPage';
+import { DraftService, DraftContent, DraftRestore, DraftSession } from '../services/DraftService';
+import { DraftRecoveryPanel } from '../components/DraftRecoveryPanel';
 
 const BLUE: string = '#3478F6';
 const INK: string = '#172B4D';
@@ -37,6 +44,12 @@ interface PreparedAudioMetadata {
   warning: string;
 }
 
+interface EditorSnapshot {
+  values: string;
+  cover: image.PixelMap | null;
+  pendingCover: image.PixelMap | undefined;
+}
+
 // Snapshot the displayed values at import or after a confirmed direct write.
 // In particular, the filename fallback for an empty title is display-only.
 interface EditBaseline {
@@ -54,6 +67,7 @@ struct Index {
   @State toastText: string = '';
   @State busy: boolean = false;
   @State showHelp: boolean = false;
+  @State showAbout: boolean = false;
   @State activeGuide: string = '';
   @State seenGuides: string[] = [];
   @State guidesReady: boolean = false;
@@ -74,32 +88,65 @@ struct Index {
   @State audioName: string = '';
   @State audioWorkingPath: string = '';
   @State audioTechnicalSummary: string = '';
-  @State songTitle: string = '';
-  @State artist: string = '';
-  @State album: string = '';
-  @State composer: string = '';
-  @State genre: string = '';
-  @State year: string = '';
-  @State albumArtist: string = '';
-  @State track: string = '';
-  @State disc: string = '';
-  @State discTotal: string = '';
-  @State trackTotal: string = '';
-  @State bpm: string = '';
-  @State grouping: string = '';
-  @State isrc: string = '';
-  @State copyright: string = '';
-  @State comment: string = '';
+  @State audioDurationMs: number = 0;
+  @State titleFromFilename: boolean = false;
+  @State cloudPreviewVisible: boolean = false;
+  @State cloudBackRequest: number = 0;
+  private cloudReturnPage: string = 'editor';
+  private cloudDialogOpen: boolean = false;
+  private cloudDialogToken: number = 0;
+  private directDialogToken: number = 0;
+  private lyricExportDialogOpen: boolean = false;
+  private lyricExportDialogToken: number = 0;
+  private missingSelectionToken: number = 0;
+  private missingPending: WorkingAudio | undefined = undefined;
+  @State @Watch('draftChanged') songTitle: string = '';
+  @State @Watch('draftChanged') artist: string = '';
+  @State @Watch('draftChanged') album: string = '';
+  @State @Watch('draftChanged') composer: string = '';
+  @State @Watch('draftChanged') genre: string = '';
+  @State @Watch('draftChanged') year: string = '';
+  @State @Watch('draftChanged') albumArtist: string = '';
+  @State @Watch('draftChanged') track: string = '';
+  @State @Watch('draftChanged') disc: string = '';
+  @State @Watch('draftChanged') discTotal: string = '';
+  @State @Watch('draftChanged') trackTotal: string = '';
+  @State @Watch('draftChanged') bpm: string = '';
+  @State @Watch('draftChanged') grouping: string = '';
+  @State @Watch('draftChanged') isrc: string = '';
+  @State @Watch('draftChanged') copyright: string = '';
+  @State @Watch('draftChanged') comment: string = '';
 
   @State coverUri: string = '';
-  @State coverPixelMap: image.PixelMap | null = null;
-  @State pendingCoverImage: image.PixelMap | undefined = undefined;
+  @State @Watch('draftChanged') coverPixelMap: image.PixelMap | null = null;
+  @State @Watch('draftChanged') pendingCoverImage: image.PixelMap | undefined = undefined;
   @State pendingCoverName: string = '';
 
   @State lyricUri: string = '';
-  @State lyricText: string = '';
-  @State lyricSourceName: string = '';
-  @State lyricSummary: string = '';
+  @State @Watch('draftChanged') lyricText: string = '';
+  @State @Watch('draftChanged') lyricSourceName: string = '';
+  @State @Watch('draftChanged') lyricSummary: string = '';
+
+  @State draftEditGeneration: number = 0;
+  @State draftStatus: string = '';
+  private draftSession: DraftSession | undefined = undefined;
+  private draftStart: Promise<void> | undefined = undefined;
+  private draftSaving: Promise<void> | undefined = undefined;
+  private draftDirty: boolean = false;
+  private draftApplying: boolean = false;
+  private draftTimer: number = -1;
+  private draftMaxTimer: number = -1;
+  private draftStartToken: number = 0;
+  private draftReturnPage: string = 'editor';
+  private draftOpenSnapshot: EditorSnapshot | undefined = undefined;
+  private draftRestoreCompleted: boolean = false;
+  private draftUncertain: DraftRestore | undefined = undefined;
+  private draftRestoring: boolean = false;
+  private draftDisappearing: boolean = false;
+  private draftLifecycleToken: number = 0;
+  private draftRevision: string = '';
+  private draftSavedSnapshot: string = '';
+  private draftCoverNeedsReselection: boolean = false;
 
   @State folderUri: string = '';
   @State folderName: string = '';
@@ -122,9 +169,13 @@ struct Index {
   @State batchCompletedKeys: string[] = [];
 
   aboutToAppear(): void {
+    this.draftLifecycleToken++;
+    this.draftDisappearing = false;
+    if (this.draftDirty) this.scheduleDraft();
     this.restoreSavedFolder();
     this.loadFirstUseGuides();
     this.checkInterruptedDirectWrite();
+    this.refreshDraftStatus();
   }
 
   private async checkInterruptedDirectWrite(showEmpty: boolean = false): Promise<void> {
@@ -174,7 +225,62 @@ struct Index {
   }
 
   aboutToDisappear(): void {
-    this.clearTask();
+    this.invalidateMissingSelection();
+    this.cancelDraftTimers();
+    this.draftDisappearing = true;
+    const lifecycleToken: number = ++this.draftLifecycleToken;
+    const exitSnapshot: EditorSnapshot = this.editorSnapshot();
+    const exitGeneration: number = this.draftEditGeneration;
+    this.flushDraftBeforeSwitch().then((): void => {
+      if (lifecycleToken !== this.draftLifecycleToken || !this.draftDisappearing) return;
+      if (this.draftEditGeneration === exitGeneration && this.sameEditorSnapshot(exitSnapshot) &&
+          !this.draftDirty && this.draftSaving === undefined && this.draftUncertain === undefined) {
+        this.clearTask();
+      } else {
+        this.draftStatus = '退出时编辑发生变化，已保留当前工作副本；草稿持久化未确认。';
+      }
+    }, (_error: Error): void => {
+      if (lifecycleToken !== this.draftLifecycleToken || !this.draftDisappearing) return;
+      this.draftStatus = '退出时草稿未能保存，当前编辑和私有工作副本未主动清理；跨进程恢复未确认。';
+    });
+  }
+
+  onPageHide(): void {
+    this.flushDraft().catch((_error: Error): void => {});
+    if (this.page === 'timing') {
+      this.page = 'lyrics';
+      this.notify('已离开试听；返回校时可重新打开。');
+    }
+    if (this.page === 'missingLyrics') {
+      this.invalidateMissingSelection();
+      this.page = 'folder';
+    }
+  }
+
+  onBackPress(): boolean {
+    if (this.showAbout) { this.showAbout = false; return true; }
+    if (this.page === 'draftRecovery') {
+      this.notify('请使用草稿页面的“稍后”按钮返回。');
+      return true;
+    }
+    if (this.page === 'timing') {
+      this.notify('请使用校时页面的返回按钮，以便先关闭试听。');
+      return true;
+    }
+    if (this.page === 'missingLyrics') {
+      this.invalidateMissingSelection();
+      this.page = 'folder';
+      return true;
+    }
+    if (this.page !== 'cloudLyrics') return false;
+    // An open confirmation dialog owns Back; it must dismiss before navigation.
+    if (this.cloudDialogOpen) return false;
+    if (this.cloudPreviewVisible) {
+      this.cloudBackRequest++;
+      return true;
+    }
+    this.page = this.cloudReturnPage;
+    return true;
   }
 
 
@@ -211,10 +317,23 @@ struct Index {
   }
 
   private switchMainTab(tab: number): void {
+    if (this.page === 'draftRecovery') {
+      this.notify('请先从草稿页面返回。');
+      return;
+    }
+    if (this.page === 'timing') {
+      this.notify('请先返回歌词编辑，以便关闭试听。');
+      return;
+    }
+    if (this.page === 'missingLyrics') {
+      this.notify('请先从补缺页面返回。');
+      return;
+    }
     if (this.busy) {
       this.notify('当前正在处理文件，请完成后再切换模式');
       return;
     }
+    if (this.page === 'cloudLyrics') this.invalidateCloudDialog();
     this.currentTab = tab;
     this.page = tab === 0 ? 'editor' : 'folder';
   }
@@ -351,6 +470,220 @@ struct Index {
     return this.getUIContext().getHostContext() as common.UIAbilityContext;
   }
 
+  private draftContent(): DraftContent {
+    return { title: this.songTitle, artist: this.artist, album: this.album, composer: this.composer,
+      genre: this.genre, year: this.year, albumArtist: this.albumArtist, track: this.track,
+      disc: this.disc, discTotal: this.discTotal, trackTotal: this.trackTotal, bpm: this.bpm,
+      grouping: this.grouping, isrc: this.isrc, copyright: this.copyright, comment: this.comment,
+      lyricText: this.lyricText, lyricSourceName: this.lyricSourceName, lyricSummary: this.lyricSummary,
+      coverNeedsReselection: this.draftCoverNeedsReselection || this.coverChanged || this.pendingCoverImage !== undefined };
+  }
+
+  private cancelDraftTimers(): void {
+    if (this.draftTimer >= 0) clearTimeout(this.draftTimer);
+    if (this.draftMaxTimer >= 0) clearTimeout(this.draftMaxTimer);
+    this.draftTimer = -1;
+    this.draftMaxTimer = -1;
+  }
+
+  private scheduleDraft(): void {
+    if (!this.draftDirty || this.draftApplying || this.draftRestoring || this.draftDisappearing) return;
+    if (this.draftTimer >= 0) clearTimeout(this.draftTimer);
+    this.draftTimer = setTimeout((): void => {
+      this.draftTimer = -1;
+      this.flushDraft().catch((_error: Error): void => {});
+    }, 1200);
+    if (this.draftMaxTimer < 0) this.draftMaxTimer = setTimeout((): void => {
+      this.draftMaxTimer = -1;
+      this.flushDraft().catch((_error: Error): void => {});
+    }, 5000);
+  }
+
+  private draftChanged(): void {
+    if (this.draftApplying) return;
+    this.draftEditGeneration++;
+    if (this.audioWorkingPath.length === 0) return;
+    this.draftDirty = true;
+    this.draftStatus = this.draftSession === undefined ? '当前编辑尚未自动保存，请检查草稿。' : '正在准备保存编辑草稿…';
+    this.scheduleDraft();
+  }
+
+  private async refreshDraftStatus(): Promise<void> {
+    try {
+      const existing = await DraftService.inspect(this.ctx());
+      if (existing !== undefined && this.draftSession === undefined) this.draftStatus = '发现未处理的编辑草稿，可查看并恢复。';
+      else if (existing === undefined && this.draftSession === undefined && !this.draftDirty) this.draftStatus = '';
+    } catch (_error) {
+      this.draftStatus = '草稿暂时无法读取，请打开草稿页面检查。';
+    }
+  }
+
+  private startDraftTracking(): void {
+    if (this.audioWorkingPath.length === 0 || this.draftRestoring) return;
+    const token: number = ++this.draftStartToken;
+    const path: string = this.audioWorkingPath;
+    const name: string = this.audioName;
+    const start: Promise<void> = (async (): Promise<void> => {
+      try {
+        const session: DraftSession = await DraftService.begin(this.ctx(), path, name);
+        if (token !== this.draftStartToken || this.audioWorkingPath !== path) return;
+        this.draftSession = session;
+        this.draftRevision = '';
+        this.draftSavedSnapshot = '';
+        this.draftStatus = this.draftDirty ? '正在准备保存编辑草稿…' : '编辑后会自动保存草稿。';
+        if (this.draftDirty) this.scheduleDraft();
+      } catch (_error) {
+        if (token === this.draftStartToken && this.audioWorkingPath === path) {
+          this.draftSession = undefined;
+          this.draftStatus = '当前编辑未自动保存；请先检查已有草稿或重试。';
+        }
+      }
+    })();
+    this.draftStart = start;
+    start.finally((): void => { if (this.draftStart === start) this.draftStart = undefined; });
+  }
+
+  private async flushDraft(): Promise<void> {
+    this.cancelDraftTimers();
+    if (this.draftSaving !== undefined) await this.draftSaving;
+    if (!this.draftDirty || this.audioWorkingPath.length === 0) return;
+    if (this.draftStart !== undefined) await this.draftStart;
+    if (this.draftSaving !== undefined) await this.draftSaving;
+    if (!this.draftDirty || this.audioWorkingPath.length === 0) return;
+    const session: DraftSession | undefined = this.draftSession;
+    if (session === undefined) {
+      this.draftStatus = '当前编辑尚未自动保存；请处理已有草稿后重试。';
+      throw new Error('当前编辑尚未自动保存，请先处理草稿。');
+    }
+    const snapshot: DraftContent = this.draftContent();
+    const snapshotText: string = JSON.stringify(snapshot);
+    const editGeneration: number = this.draftEditGeneration;
+    this.draftDirty = false;
+    const saving: Promise<void> = (async (): Promise<void> => {
+      try {
+        const saved = await DraftService.save(this.ctx(), session, snapshot);
+        if (this.draftSession === session) {
+          this.draftRevision = saved.revision;
+          this.draftSavedSnapshot = snapshotText;
+          this.draftDirty = this.draftEditGeneration !== editGeneration;
+          this.draftStatus = this.draftDirty ? '编辑仍在变化，草稿将继续保存。' : '编辑草稿已自动保存。';
+        }
+      } catch (error) {
+        if (this.draftSession === session) {
+          this.draftDirty = true;
+          this.draftStatus = '草稿保存失败，当前编辑仍在；请检查后重试。';
+        }
+        throw error as Error;
+      }
+    })();
+    this.draftSaving = saving;
+    try { await saving; }
+    finally {
+      if (this.draftSaving === saving) this.draftSaving = undefined;
+      if (this.draftDirty && this.draftSession === session) this.scheduleDraft();
+    }
+  }
+
+  private async flushDraftBeforeSwitch(): Promise<void> {
+    if (this.draftUncertain !== undefined) throw new Error('请先处理草稿恢复的不确定状态。');
+    if (this.draftStart !== undefined) await this.draftStart;
+    do {
+      if (this.draftSaving !== undefined) await this.draftSaving;
+      if (this.draftDirty) await this.flushDraft();
+    } while (this.draftDirty || this.draftSaving !== undefined);
+  }
+
+  private async openDraftRecovery(): Promise<void> {
+    if (this.busy || this.page === 'draftRecovery' || this.page === 'timing' || this.page === 'missingLyrics') return;
+    if (this.draftUncertain !== undefined) { this.notify('请先核对并处理上次草稿恢复状态。'); return; }
+    this.busy = true;
+    try {
+      if (this.draftSession !== undefined) await this.flushDraftBeforeSwitch();
+      this.draftReturnPage = this.page;
+      this.draftOpenSnapshot = this.editorSnapshot();
+      this.draftRestoreCompleted = false;
+      this.page = 'draftRecovery';
+    } catch (_error) {
+      this.notify('当前编辑草稿未保存，请先重试或导出当前编辑。');
+    } finally { this.busy = false; }
+  }
+
+  private acceptDraft(result: DraftRestore, expectedGeneration: number, claim: () => void): boolean {
+    const snapshot: EditorSnapshot | undefined = this.draftOpenSnapshot;
+    if (this.busy || this.page !== 'draftRecovery' || snapshot === undefined ||
+        this.draftEditGeneration !== expectedGeneration || !this.sameEditorSnapshot(snapshot)) return false;
+    claim();
+    this.draftRestoring = true;
+    try {
+      this.adoptWorkingAudio(result.audio);
+      this.draftApplying = true;
+      const content: DraftContent = result.content;
+      this.songTitle = content.title; this.artist = content.artist; this.album = content.album;
+      this.composer = content.composer; this.genre = content.genre; this.year = content.year;
+      this.albumArtist = content.albumArtist; this.track = content.track; this.disc = content.disc;
+      this.discTotal = content.discTotal; this.trackTotal = content.trackTotal; this.bpm = content.bpm;
+      this.grouping = content.grouping; this.isrc = content.isrc; this.copyright = content.copyright;
+      this.comment = content.comment; this.lyricText = content.lyricText; this.lyricUri = '';
+      this.lyricSourceName = content.lyricSourceName; this.lyricSummary = content.lyricSummary;
+      this.draftCoverNeedsReselection = content.coverNeedsReselection;
+      this.titleFromFilename = (result.audio.metadata.title || '').trim().length === 0 &&
+        content.title === result.audio.sourceName.replace(/\.[^.]+$/, '');
+      this.draftRevision = result.revision;
+      this.draftSavedSnapshot = JSON.stringify(content);
+      this.draftDirty = false;
+      this.draftRestoreCompleted = true;
+      this.draftEditGeneration++;
+      return true;
+    } finally {
+      this.draftApplying = false;
+      this.draftRestoring = false;
+    }
+  }
+
+  private draftCommitted(session: DraftSession): void {
+    this.draftSession = session;
+    this.draftStatus = this.draftCoverNeedsReselection ? '草稿已恢复；封面需要重新选择。' : '草稿已恢复。';
+  }
+
+  private draftDeleted(): void {
+    const needsSave: boolean = this.draftDirty && JSON.stringify(this.draftContent()) !== this.draftSavedSnapshot;
+    this.draftStartToken++;
+    this.draftSession = undefined;
+    this.draftRevision = '';
+    this.draftSavedSnapshot = '';
+    this.draftDirty = needsSave;
+    this.draftStatus = needsSave ? '现有编辑尚未保存草稿，将重新尝试。' : '草稿已删除。';
+    if (this.audioWorkingPath.length > 0) this.startDraftTracking();
+  }
+
+  private closeDraftRecovery(): void {
+    this.page = this.draftRestoreCompleted ? 'lyrics' : this.draftReturnPage;
+    this.draftOpenSnapshot = undefined;
+    this.draftRestoreCompleted = false;
+    if (this.draftSession === undefined && this.draftUncertain === undefined) this.refreshDraftStatus();
+  }
+
+  private draftRecoveryIssue(result: DraftRestore, state: string, warning: string): void {
+    this.cancelDraftTimers();
+    this.draftSession = undefined;
+    this.draftUncertain = result;
+    this.draftStatus = '恢复状态需要检查，自动保存已暂停；原草稿仍保留，临时音频仅在当前会话保留。';
+    this.notify(warning + (state === 'uncertain' ? ' 请检查当前编辑并手动导出。' : ' 请检查当前编辑。'));
+  }
+
+  private acknowledgeDraftIssue(): void {
+    if (this.busy || this.draftUncertain === undefined) return;
+    this.getUIContext().showAlertDialog({
+      title: '确认已处理恢复状态？',
+      message: '请先核对当前编辑并手动导出需要保留的内容。原草稿仍然保留；解除暂停后仍需处理草稿才能恢复自动保存。',
+      primaryButton: { value: '继续检查', action: () => {} },
+      secondaryButton: { value: '已核对并保存', action: () => {
+        this.draftUncertain = undefined;
+        this.draftStatus = '原草稿仍保留；请在草稿页面处理后再恢复自动保存。';
+      } }
+    });
+  }
+
   private describeError(error: Object, fallback: string = '未知错误'): string {
     if (error instanceof Error) return error.message;
     const msg: string = (error as BusinessError).message || '';
@@ -358,7 +691,16 @@ struct Index {
   }
 
   private clearTask(): void {
-    if (this.audioWorkingPath.length > 0) AudioMetadataService.removeWorkingFile(this.audioWorkingPath);
+    this.draftApplying = true;
+    this.cancelDraftTimers();
+    this.draftStartToken++;
+    this.draftSession = undefined;
+    this.lyricExportDialogOpen = false;
+    this.lyricExportDialogToken++;
+    if (this.audioWorkingPath.length > 0 &&
+        (this.draftUncertain === undefined || this.draftUncertain.audio.workingPath !== this.audioWorkingPath)) {
+      AudioMetadataService.removeWorkingFile(this.audioWorkingPath);
+    }
     this.audioUri = '';
     this.audioName = '';
     this.audioWorkingPath = '';
@@ -373,6 +715,12 @@ struct Index {
     this.editBaseline = undefined;
     this.coverChanged = false;
     this.audioTechnicalSummary = '';
+    this.audioDurationMs = 0;
+    this.titleFromFilename = false;
+    this.cloudPreviewVisible = false;
+    this.cloudDialogOpen = false;
+    this.cloudDialogToken++;
+    this.directDialogToken++;
     this.songTitle = '';
     this.artist = '';
     this.album = '';
@@ -398,6 +746,7 @@ struct Index {
     this.lyricSourceName = '';
     this.lyricSummary = '';
     this.moreInfoVisible = false;
+    this.draftApplying = false;
   }
 
   private async importAudio(): Promise<void> {
@@ -405,18 +754,64 @@ struct Index {
     this.busy = true;
     this.notify('');
     try {
+      await this.flushDraftBeforeSwitch();
+      const previousSnapshot: EditorSnapshot = this.editorSnapshot();
+      const previousGeneration: number = this.draftEditGeneration;
       const context = this.ctx();
       const selected: SelectedDocument | undefined = await FileSelectionService.selectOne(context, 'audio');
       if (selected === undefined) {
         this.notify('已取消音频选择');
         return;
       }
-      const previousPath: string = this.audioWorkingPath;
+      if (this.draftEditGeneration !== previousGeneration || !this.sameEditorSnapshot(previousSnapshot)) {
+        this.notify('当前编辑已变化，未替换歌曲。');
+        return;
+      }
       // 在新音频完整复制且标签读取成功前，保留当前编辑任务。
       const working = await AudioMetadataService.importToSandbox(selected.uri, selected.name, context.filesDir);
-      this.audioUri = selected.uri;
-      this.audioName = selected.name;
+      if (this.draftEditGeneration !== previousGeneration || !this.sameEditorSnapshot(previousSnapshot)) {
+        if (working.metadata.coverImage !== undefined) { try { await working.metadata.coverImage.release(); } catch (_error) {} }
+        await AudioMetadataService.removeWorkingFileChecked(working.workingPath);
+        this.notify('当前编辑已变化，未替换歌曲。');
+        return;
+      }
+      this.adoptWorkingAudio(working);
+      // 成功提示仅短暂显示，不占用底部的持久状态栏。
+      if (/\.wma$/i.test(selected.name)) {
+        this.notify('WMA 仅支持部分文件的副本导出；标签空间不足或结构不受支持时会拒绝。');
+      } else if (/\.(ogg|opus)$/i.test(selected.name)) {
+        this.notify('OGG/OPUS 目前仅支持部分单流文件的副本导出，暂不支持更换封面。');
+      } else {
+        this.getUIContext().getPromptAction().showToast({ message: '已成功读取音频元数据', duration: 2000 });
+      }
+    } catch (error) {
+      this.notify('音频读取失败：' + (this.describeError(error)));
+    } finally {
+      this.busy = false;
+    }
+  }
+
+  /** Adopt a fully imported private copy only after the caller has confirmed replacement. */
+  private adoptWorkingAudio(working: WorkingAudio): void {
+      this.directDialogToken++;
+      const previousPath: string = this.audioWorkingPath;
+      const previousCover: image.PixelMap | null = this.coverPixelMap;
+      const previousPending: image.PixelMap | undefined = this.pendingCoverImage;
+      this.draftApplying = true;
+      this.draftStartToken++;
+      this.draftSession = undefined;
+      this.draftDirty = false;
+      this.draftRevision = '';
+      this.draftSavedSnapshot = '';
+      this.draftCoverNeedsReselection = false;
+      this.cancelDraftTimers();
+      this.audioUri = working.sourceUri;
+      this.audioName = working.sourceName;
       this.audioWorkingPath = working.workingPath;
+      this.audioDurationMs = Number.isFinite(working.metadata.durationMs) && working.metadata.durationMs > 0
+        ? Math.round(working.metadata.durationMs)
+        : (Number.isFinite(working.metadata.duration) && working.metadata.duration > 0
+          ? Math.round(working.metadata.duration * 1000) : 0);
       this.audioSaveMode = 'exportCopy';
       this.directOptionsVisible = false;
       this.originalYear = working.metadata.year;
@@ -431,8 +826,11 @@ struct Index {
       this.lyricText = '';
       this.pendingCoverImage = undefined;
       this.pendingCoverName = '';
+      this.draftCoverNeedsReselection = false;
       this.coverUri = '';
-      this.songTitle = working.metadata.title || selected.name.replace(/\.[^.]+$/, '');
+      const tagTitle: string = working.metadata.title || '';
+      this.titleFromFilename = tagTitle.trim().length === 0;
+      this.songTitle = this.titleFromFilename ? working.sourceName.replace(/\.[^.]+$/, '') : tagTitle;
       this.artist = working.metadata.artist || '';
       this.album = working.metadata.album || '';
       this.genre = working.metadata.genre || '';
@@ -456,21 +854,23 @@ struct Index {
       if (working.metadata.lyrics && working.metadata.lyrics.length > 0) this.lyricText = working.metadata.lyrics;
       this.captureEditBaseline();
       if (previousPath.length > 0 && previousPath !== working.workingPath) {
-        await AudioMetadataService.removeWorkingFile(previousPath);
+        try {
+          AudioMetadataService.removeWorkingFile(previousPath).catch((_error: Error): void => {
+            this.notify('旧的音频工作副本未能清理，请稍后重启应用。');
+          });
+        } catch (_error) { this.notify('旧的音频工作副本未能清理，请稍后重启应用。'); }
       }
-      // 成功提示仅短暂显示，不占用底部的持久状态栏。
-      if (/\.wma$/i.test(selected.name)) {
-        this.notify('WMA 仅支持部分文件的副本导出；标签空间不足或结构不受支持时会拒绝。');
-      } else if (/\.(ogg|opus)$/i.test(selected.name)) {
-        this.notify('OGG/OPUS 目前仅支持部分单流文件的副本导出，暂不支持更换封面。');
-      } else {
-        this.getUIContext().getPromptAction().showToast({ message: '已成功读取音频元数据', duration: 2000 });
+      if (previousCover !== null && previousCover !== this.coverPixelMap) {
+        try { previousCover.release().catch((_error: Error): void => { this.notify('旧封面资源未能释放。'); }); }
+        catch (_error) { this.notify('旧封面资源未能释放。'); }
       }
-    } catch (error) {
-      this.notify('音频读取失败：' + (this.describeError(error)));
-    } finally {
-      this.busy = false;
-    }
+      if (previousPending !== undefined && previousPending !== previousCover && previousPending !== this.coverPixelMap) {
+        try { previousPending.release().catch((_error: Error): void => { this.notify('旧封面预览未能释放。'); }); }
+        catch (_error) { this.notify('旧封面预览未能释放。'); }
+      }
+      this.draftApplying = false;
+      this.draftEditGeneration++;
+      if (!this.draftRestoring) this.startDraftTracking();
   }
 
   private async loadCoverFromFile(): Promise<void> {
@@ -537,6 +937,7 @@ struct Index {
     if (!this.busy && this.pendingCoverImage !== undefined) {
       this.coverPixelMap = this.pendingCoverImage || null;
       this.coverChanged = true;
+      this.draftCoverNeedsReselection = false;
       this.pendingCoverImage = undefined;
       this.pendingCoverName = '';
       this.notify('已确认新封面；保存音频时写入');
@@ -576,6 +977,89 @@ struct Index {
     }
   }
 
+  private openCloudLyrics(returnPage: string): void {
+    if (this.busy || this.audioWorkingPath.length === 0) return;
+    this.invalidateCloudDialog();
+    this.cloudPreviewVisible = false;
+    this.cloudReturnPage = returnPage;
+    this.page = 'cloudLyrics';
+  }
+
+  private openLyricTiming(): void {
+    if (this.busy || this.audioWorkingPath.length === 0 || this.lyricText.length === 0) {
+      this.notify('请先选择音频并载入带时间的歌词。');
+      return;
+    }
+    this.page = 'timing';
+  }
+
+  private applyLyricTiming(result: LyricTimingResult): void {
+    if (this.busy || this.page !== 'timing' ||
+        result.targetKey !== this.audioUri + '|' + this.audioWorkingPath ||
+        result.originalText !== this.lyricText || result.adjustedText.length === 0) {
+      this.notify('歌曲或歌词已变化，未采用校时结果。');
+      return;
+    }
+    this.lyricText = result.adjustedText;
+    this.page = 'lyrics';
+    this.notify('已将校时结果载入编辑区；保存音频后才会写入。');
+  }
+
+  private invalidateCloudDialog(): void {
+    this.cloudDialogToken++;
+    this.cloudDialogOpen = false;
+  }
+
+  private confirmCloudLyrics(selection: CloudLyricsSelection): void {
+    const targetKey: string = this.audioUri + '|' + this.audioWorkingPath;
+    if (this.busy || this.cloudDialogOpen || this.page !== 'cloudLyrics' || selection.targetKey !== targetKey ||
+        selection.text.trim().length === 0) {
+      this.notify('当前歌曲或歌词已变化，请重新搜索并预览。');
+      return;
+    }
+    const originalText: string = this.lyricText;
+    const originalUri: string = this.lyricUri;
+    const originalSourceName: string = this.lyricSourceName;
+    const originalSummary: string = this.lyricSummary;
+    const dialogToken: number = ++this.cloudDialogToken;
+    const apply: () => void = () => {
+      if (this.cloudDialogToken !== dialogToken || this.busy || this.page !== 'cloudLyrics' ||
+          selection.targetKey !== this.audioUri + '|' + this.audioWorkingPath ||
+          this.lyricText !== originalText || this.lyricUri !== originalUri ||
+          this.lyricSourceName !== originalSourceName || this.lyricSummary !== originalSummary) return;
+      this.invalidateCloudDialog();
+      this.lyricUri = '';
+      this.lyricText = selection.text;
+      this.lyricSourceName = selection.song.title + '.lrc';
+      this.lyricSummary = (selection.kind === 'translation' ? '云端译文' :
+        (selection.kind === 'bilingual' ? '云端原文+译文' : '云端原文')) +
+        ' · 网易云音乐 · ' + selection.song.artists.join(' / ') +
+        ' · 歌曲 ID ' + selection.song.id;
+      this.page = 'lyrics';
+      this.notify('已采用云端歌词；保存音频后才会写入文件。');
+    };
+    if (this.lyricText.trim().length > 0 && this.lyricText !== selection.text) {
+      this.cloudDialogOpen = true;
+      const dismiss: () => void = () => {
+        if (this.cloudDialogToken === dialogToken) this.invalidateCloudDialog();
+      };
+      try {
+        this.getUIContext().showAlertDialog({
+          title: '替换当前编辑中的歌词？',
+          message: '采用后会替换本次编辑的歌词。原音频要到保存时才会修改。',
+          primaryButton: { value: '保留现有歌词', action: dismiss },
+          secondaryButton: { value: '采用云端歌词', action: apply },
+          onDidDisappear: dismiss
+        });
+      } catch (error) {
+        dismiss();
+        this.notify('无法显示歌词替换确认：' + this.describeError(error));
+      }
+    } else {
+      apply();
+    }
+  }
+
   private async pasteLyrics(): Promise<void> {
     // 仅由系统 PasteButton 的成功点击回调直接调用，使用其临时授权。
     if (this.busy) return;
@@ -600,7 +1084,53 @@ struct Index {
     }
   }
 
-  private async exportLyrics(): Promise<void> {
+  private async requestLyricsExport(): Promise<void> {
+    if (this.busy || this.lyricExportDialogOpen) return;
+    if (!hasInlineLrcTiming(this.lyricText)) { this.exportLyrics(); return; }
+    const text: string = this.lyricText;
+    const name: string = this.lyricSourceName;
+    const page: string = this.page;
+    const target: string = this.audioUri + '|' + this.audioWorkingPath;
+    this.busy = true;
+    let parsed: LyricDocument;
+    try { parsed = await parseLyricAsync(text, ''); }
+    catch (error) {
+      this.notify('无法识别歌词格式：' + this.describeError(error));
+      return;
+    } finally { this.busy = false; }
+    if (this.page !== page || this.lyricText !== text || this.lyricSourceName !== name ||
+        this.audioUri + '|' + this.audioWorkingPath !== target) return;
+    if (parsed.format !== 'lrc' && parsed.format !== 'enhanced-lrc') { this.exportLyrics(); return; }
+    const token: number = ++this.lyricExportDialogToken;
+    this.lyricExportDialogOpen = true;
+    const dismiss: () => void = () => {
+      if (this.lyricExportDialogToken === token) {
+        this.lyricExportDialogOpen = false;
+        this.lyricExportDialogToken++;
+      }
+    };
+    const choose: (ordinary: boolean) => void = (ordinary: boolean) => {
+      if (!this.lyricExportDialogOpen || this.lyricExportDialogToken !== token || this.busy ||
+          this.page !== page || this.lyricText !== text || this.lyricSourceName !== name ||
+          this.audioUri + '|' + this.audioWorkingPath !== target) return;
+      dismiss();
+      this.exportLyrics(ordinary);
+    };
+    try {
+      this.getUIContext().showAlertDialog({
+        title: '选择歌词导出格式',
+        message: '保留逐字时间会按 UTF-8 保存编辑区文本；普通逐行版会移除行内时间标记。编辑区内容不会改变。',
+        primaryButton: { value: '保留逐字时间', action: () => choose(false) },
+        secondaryButton: { value: '导出普通逐行', action: () => choose(true) },
+        onDidDisappear: dismiss
+      });
+    } catch (error) {
+      dismiss();
+      this.notify('无法显示导出选项：' + this.describeError(error));
+    }
+  }
+
+  private async exportLyrics(ordinary: boolean = false): Promise<void> {
     if (this.busy) return;
     if (this.lyricText.length === 0) {
       this.notify('没有可导出的歌词');
@@ -617,9 +1147,15 @@ struct Index {
       let outputName: string = base + (parsed.format === 'txt' || parsed.format === 'unknown' ? '.txt' : '.lrc');
       let outputText: string = this.lyricText;
       let conversionWarning: string = '';
+      if (ordinary) {
+        if (parsed.format !== 'lrc' && parsed.format !== 'enhanced-lrc') throw new Error('当前内容不是可转换的 LRC 歌词。');
+        outputText = plainLrcFromEnhanced(this.lyricText);
+        conversionWarning = '已移除行内逐字时间标记。';
+      }
       if (parsed.format === 'srt' || parsed.format === 'vtt' ||
           parsed.format === 'sbv' || parsed.format === 'ass') {
         const converted = await convertToLrcAsync(parsed);
+        if (converted.text.trim().length === 0) throw new Error('歌词转换结果为空，已取消导出。');
         outputText = converted.text;
         if (converted.warnings.length > 0) conversionWarning = converted.warnings.join('；');
       }
@@ -665,6 +1201,7 @@ struct Index {
       if (lyricDocument.format === 'srt' || lyricDocument.format === 'vtt' ||
           lyricDocument.format === 'sbv' || lyricDocument.format === 'ass') {
         const convertedLyrics = await convertToLrcAsync(lyricDocument);
+        if (convertedLyrics.text.trim().length === 0) throw new Error('歌词转换结果为空，已取消保存。');
         embeddedLyrics = convertedLyrics.text;
         if (convertedLyrics.warnings.length > 0) lyricConversionWarning = convertedLyrics.warnings.join('；');
       }
@@ -794,20 +1331,39 @@ struct Index {
       this.notify('请先选择音频');
       return;
     }
+    const confirmedSnapshot: EditorSnapshot = this.editorSnapshot();
+    const confirmedGeneration: number = this.draftEditGeneration;
+    const dialogToken: number = ++this.directDialogToken;
+    const dismiss: () => void = (): void => {
+      if (this.directDialogToken === dialogToken) this.directDialogToken++;
+    };
     this.getUIContext().showAlertDialog({
       title: '确认直写源文件？',
       message: '将修改所选原音频。写入前会创建并校验下载目录中的备份与应用内备份。' +
         '备份不能保证在所有故障下恢复；请确保另有可用备份后再继续。',
-      primaryButton: { value: '取消', action: () => {} },
+      primaryButton: { value: '取消', action: dismiss },
       secondaryButton: {
         value: '确认直写',
-        action: () => { this.writeOriginalAudioMetadata(); }
-      }
+        action: () => {
+          if (dialogToken !== this.directDialogToken || this.busy ||
+              this.draftEditGeneration !== confirmedGeneration || !this.sameEditorSnapshot(confirmedSnapshot)) {
+            this.notify('歌曲或编辑已变化，请重新确认直写。');
+            return;
+          }
+          dismiss();
+          this.writeOriginalAudioMetadata(confirmedSnapshot, confirmedGeneration);
+        }
+      },
+      onDidDisappear: dismiss
     });
   }
 
-  private async writeOriginalAudioMetadata(): Promise<void> {
+  private async writeOriginalAudioMetadata(confirmedSnapshot: EditorSnapshot, confirmedGeneration: number): Promise<void> {
     if (this.busy) return;
+    if (this.draftEditGeneration !== confirmedGeneration || !this.sameEditorSnapshot(confirmedSnapshot)) {
+      this.notify('歌曲或编辑已变化，请重新确认直写。');
+      return;
+    }
     if (this.pendingCoverImage !== undefined) {
       this.notify('请先确认或取消待确认的封面图片，再保存');
       return;
@@ -815,7 +1371,19 @@ struct Index {
     this.busy = true;
     this.notify('');
     try {
+      await this.flushDraftBeforeSwitch();
+      if (this.draftEditGeneration !== confirmedGeneration || !this.sameEditorSnapshot(confirmedSnapshot)) {
+        throw new Error('歌曲或编辑在保存草稿期间变化，请重新确认直写。');
+      }
+      const editorBeforeWrite: EditorSnapshot = confirmedSnapshot;
+      const editorGeneration: number = confirmedGeneration;
+      const priorSession: DraftSession | undefined = this.draftSession;
+      const priorRevision: string = this.draftRevision;
+      const savedDraftContent: string = JSON.stringify(this.draftContent());
       const prepared: PreparedAudioMetadata = await this.prepareAudioMetadata(true);
+      if (this.draftEditGeneration !== editorGeneration || !this.sameEditorSnapshot(editorBeforeWrite)) {
+        throw new Error('歌曲或编辑在准备直写期间变化，请重新确认。');
+      }
       if (Object.keys(prepared.fields).length === 0) {
         this.notify('没有需要直写的更改');
         return;
@@ -827,35 +1395,239 @@ struct Index {
         workingPath: this.audioWorkingPath,
         fields: prepared.fields
       });
-      this.originalYear = prepared.fields.year === undefined ? this.originalYear : prepared.fields.year;
-      this.originalTrack = prepared.fields.track === undefined ? this.originalTrack : prepared.fields.track;
-      this.originalDisc = prepared.fields.disc === undefined ? this.originalDisc : prepared.fields.disc;
-      this.originalDiscTotal = prepared.fields.discTotal === undefined ? this.originalDiscTotal : prepared.fields.discTotal;
-      this.originalTrackTotal = prepared.fields.trackTotal === undefined ? this.originalTrackTotal : prepared.fields.trackTotal;
-      this.originalBpm = prepared.fields.bpm === undefined ? this.originalBpm : prepared.fields.bpm;
-      if (prepared.fields.lyrics !== undefined) this.lyricText = prepared.fields.lyrics;
-      this.captureEditBaseline();
+      let savedDraftWarning: string = '';
+      let refreshedAdopted: boolean = false;
       // 后续副本导出必须基于直写后的文件，而不是之前导入时的旧工作副本。
       try {
         const previousPath: string = this.audioWorkingPath;
         const refreshed = await AudioMetadataService.importToSandbox(this.audioUri, this.audioName, this.ctx().filesDir);
+        if (this.draftEditGeneration !== editorGeneration || !this.sameEditorSnapshot(editorBeforeWrite)) {
+          if (refreshed.metadata.coverImage !== undefined) { try { await refreshed.metadata.coverImage.release(); } catch (_error) {} }
+          await AudioMetadataService.removeWorkingFileChecked(refreshed.workingPath);
+          this.draftSession = undefined;
+          this.draftStatus = '直写期间编辑发生变化，草稿仍保留，自动保存已暂停。';
+          this.notify('直写已完成，但编辑已变化。请检查当前编辑；旧草稿可能只匹配直写前备份。');
+          return;
+        }
+        let removedSavedDraft: boolean = false;
+        if (priorSession !== undefined && priorRevision.length > 0 && this.draftSavedSnapshot === savedDraftContent &&
+            !this.draftCoverNeedsReselection) {
+          try {
+            removedSavedDraft = await DraftService.discardIf(this.ctx(), priorRevision, (): boolean =>
+              this.draftSession === priorSession && this.draftRevision === priorRevision && !this.draftDirty &&
+              this.draftEditGeneration === editorGeneration && this.sameEditorSnapshot(editorBeforeWrite) &&
+              this.draftSavedSnapshot === savedDraftContent && JSON.stringify(this.draftContent()) === savedDraftContent);
+            if (!removedSavedDraft) savedDraftWarning = '草稿或编辑已变化，旧草稿仍保留；它可能只匹配直写前备份。';
+          } catch (_error) {
+            savedDraftWarning = '草稿清理结果无法确认；请检查草稿和直写前备份。';
+          }
+        } else if (priorSession !== undefined && priorRevision.length > 0) {
+          savedDraftWarning = this.draftCoverNeedsReselection ? '恢复的封面尚未重新选择，旧草稿仍保留。' :
+            '当前编辑与已保存草稿不一致，旧草稿仍保留；它可能只匹配直写前备份。';
+        }
+        if (this.draftEditGeneration !== editorGeneration || !this.sameEditorSnapshot(editorBeforeWrite)) {
+          if (refreshed.metadata.coverImage !== undefined) { try { await refreshed.metadata.coverImage.release(); } catch (_error) {} }
+          await AudioMetadataService.removeWorkingFileChecked(refreshed.workingPath);
+          this.draftSession = undefined;
+          this.draftStatus = '直写后编辑发生变化，自动保存已暂停；请手动保存并检查草稿。';
+          this.notify('直写已完成，但当前编辑已变化；未替换它。请手动导出并检查草稿及备份。');
+          return;
+        }
+        this.draftApplying = true;
+        this.originalYear = prepared.fields.year === undefined ? this.originalYear : prepared.fields.year;
+        this.originalTrack = prepared.fields.track === undefined ? this.originalTrack : prepared.fields.track;
+        this.originalDisc = prepared.fields.disc === undefined ? this.originalDisc : prepared.fields.disc;
+        this.originalDiscTotal = prepared.fields.discTotal === undefined ? this.originalDiscTotal : prepared.fields.discTotal;
+        this.originalTrackTotal = prepared.fields.trackTotal === undefined ? this.originalTrackTotal : prepared.fields.trackTotal;
+        this.originalBpm = prepared.fields.bpm === undefined ? this.originalBpm : prepared.fields.bpm;
+        if (prepared.fields.lyrics !== undefined) this.lyricText = prepared.fields.lyrics;
+        this.captureEditBaseline();
         this.audioWorkingPath = refreshed.workingPath;
+        // Recheck the actual source after saving: an unchanged filename fallback
+        // is display-only and may still not exist as an embedded title tag.
+        this.titleFromFilename = this.songTitle.trim().length > 0 &&
+          (refreshed.metadata.title || '').trim().length === 0;
+        this.draftApplying = false;
+        this.draftEditGeneration++;
+        // Start tracking the newly verified source before any asynchronous cleanup.
+        // Later edits may arrive while the old copy or cover is being released.
+        this.draftStartToken++;
+        this.draftSession = undefined;
+        this.draftRevision = '';
+        this.draftSavedSnapshot = '';
+        if (removedSavedDraft || (priorRevision.length === 0 && !this.draftDirty)) {
+          this.draftCoverNeedsReselection = false;
+          this.startDraftTracking();
+        } else {
+          this.draftStatus = '旧草稿仍需处理；当前编辑暂未自动保存。';
+        }
+        refreshedAdopted = true;
         if (previousPath.length > 0 && previousPath !== refreshed.workingPath) {
           await AudioMetadataService.removeWorkingFile(previousPath);
         }
+        if (refreshed.metadata.coverImage !== undefined && refreshed.metadata.coverImage !== this.coverPixelMap) {
+          try { await refreshed.metadata.coverImage.release(); } catch (_error) {}
+        }
       } catch (_refreshError) {
-        this.clearTask();
-        this.notify('直写已完成，但无法刷新编辑副本，请重新选择音频。下载目录备份：' + saved.externalBackupName);
+        this.draftApplying = false;
+        if (refreshedAdopted) {
+          this.draftStatus = this.draftDirty ? '直写已完成，后续编辑待保存；旧资源清理失败。' : '直写已完成，但旧资源清理失败。';
+          this.notify('直写已完成，但旧工作副本或封面资源未能清理；当前编辑未清除。');
+          return;
+        }
+        this.draftSession = undefined;
+        this.draftStatus = '直写已完成但编辑副本未刷新；草稿保留，可能只匹配直写前备份。';
+        this.notify('直写已完成，但无法刷新编辑副本。草稿未自动清除，请检查下载目录备份：' + saved.externalBackupName);
         return;
       }
       this.showExportSuccess('直写完成：源音频已更新');
       this.notify('直写前备份已保存在下载目录：' + saved.externalBackupName +
+        (savedDraftWarning.length > 0 ? '。' + savedDraftWarning : '') +
         (prepared.warning.length > 0 ? '。歌词格式转换提示：' + prepared.warning : ''));
     } catch (error) {
       this.notify(this.describeError(error, '直写失败'));
     } finally {
       this.busy = false;
     }
+  }
+
+  private invalidateMissingSelection(): void {
+    this.missingSelectionToken++;
+    const pending: WorkingAudio | undefined = this.missingPending;
+    this.missingPending = undefined;
+    if (pending !== undefined) {
+      if (pending.metadata.coverImage !== undefined) {
+        try { pending.metadata.coverImage.release().catch((_error: Error): void => {}); } catch (_error) {}
+      }
+      try {
+        AudioMetadataService.removeWorkingFileChecked(pending.workingPath).catch((_error: Error): void => {
+          this.notify('未采用的音频工作副本未能清理，请稍后重启应用。');
+        });
+      } catch (_error) { this.notify('未采用的音频工作副本未能清理，请稍后重启应用。'); }
+    }
+  }
+
+  private openMissingLyrics(): void {
+    if (this.busy || this.folderUri.length === 0) {
+      this.notify('请先选择并授权文件夹。');
+      return;
+    }
+    this.invalidateMissingSelection();
+    this.page = 'missingLyrics';
+  }
+
+  private editorSnapshot(): EditorSnapshot {
+    return { values: JSON.stringify([this.audioUri, this.audioName, this.audioWorkingPath, this.audioSaveMode,
+      this.audioDurationMs, this.titleFromFilename, this.originalYear, this.originalTrack, this.originalDisc,
+      this.originalDiscTotal, this.originalTrackTotal, this.originalBpm, this.editBaseline,
+      this.songTitle, this.artist, this.album, this.genre, this.year, this.albumArtist, this.composer,
+      this.track, this.disc, this.discTotal, this.trackTotal, this.bpm, this.grouping, this.isrc,
+      this.copyright, this.comment, this.lyricText, this.lyricUri, this.lyricSourceName, this.lyricSummary,
+      this.coverUri, this.pendingCoverName, this.coverChanged]),
+      cover: this.coverPixelMap, pendingCover: this.pendingCoverImage };
+  }
+
+  private sameEditorSnapshot(snapshot: EditorSnapshot): boolean {
+    const current: EditorSnapshot = this.editorSnapshot();
+    return current.values === snapshot.values && current.cover === snapshot.cover && current.pendingCover === snapshot.pendingCover;
+  }
+
+  private missingIdentityMatches(selection: MissingLyricsSelection, working: WorkingAudio): boolean {
+    const title: string = (working.metadata.title || '').trim();
+    const fromFilename: boolean = title.length === 0;
+    const displayedTitle: string = fromFilename ? working.sourceName.replace(/\.[^.]+$/, '') : title;
+    const actualDuration: number = working.metadata.durationMs > 0 ? working.metadata.durationMs :
+      (working.metadata.duration > 0 ? working.metadata.duration * 1000 : 0);
+    const expected = selection.expectedIdentity;
+    return selection.expectedTitleFromFilename === fromFilename && displayedTitle === expected.title &&
+      (working.metadata.artist || '') === expected.artist && (working.metadata.album || '') === expected.album &&
+      (expected.durationMs <= 0 || (actualDuration > 0 && Math.abs(actualDuration - expected.durationMs) <= 1000));
+  }
+
+  private confirmMissingSelection(selection: MissingLyricsSelection): void {
+    if (this.busy || this.page !== 'missingLyrics' || selection.text.trim().length === 0) return;
+    const token: number = ++this.missingSelectionToken;
+    const folder: string = this.folderUri;
+    const snapshot: EditorSnapshot = this.editorSnapshot();
+    let started: boolean = false;
+    const dismiss: () => void = () => {
+      if (!started && token === this.missingSelectionToken) { this.invalidateMissingSelection(); this.page = 'folder'; }
+    };
+    try {
+      this.getUIContext().showAlertDialog({
+        title: '打开所选歌曲？',
+        message: '将重新读取“' + selection.audioName + '”。当前编辑任务会被替换；云端歌词只载入编辑区，不会自动保存。',
+        primaryButton: { value: '取消', action: dismiss },
+        secondaryButton: { value: '重新读取', action: () => {
+          if (started || token !== this.missingSelectionToken) return;
+          started = true;
+          this.prepareMissingSelection(selection, token, folder, snapshot);
+        } },
+        onDidDisappear: dismiss
+      });
+    } catch (error) {
+      dismiss();
+      this.notify('无法显示确认：' + this.describeError(error));
+    }
+  }
+
+  private async prepareMissingSelection(selection: MissingLyricsSelection, token: number, folder: string,
+    snapshot: EditorSnapshot): Promise<void> {
+    if (this.busy || this.page !== 'missingLyrics' || token !== this.missingSelectionToken ||
+        folder !== this.folderUri || !this.sameEditorSnapshot(snapshot)) return;
+    this.busy = true;
+    try {
+      await this.flushDraftBeforeSwitch();
+      if (token !== this.missingSelectionToken || this.page !== 'missingLyrics' || folder !== this.folderUri ||
+          !this.sameEditorSnapshot(snapshot)) return;
+      const working: WorkingAudio = await AudioMetadataService.importToSandbox(selection.audioUri, selection.audioName, this.ctx().filesDir, true);
+      if (token !== this.missingSelectionToken || this.page !== 'missingLyrics' || folder !== this.folderUri ||
+          !this.sameEditorSnapshot(snapshot)) {
+        this.missingPending = working; this.invalidateMissingSelection(); return;
+      }
+      this.missingPending = working;
+      if (!this.missingIdentityMatches(selection, working)) {
+        this.invalidateMissingSelection(); this.page = 'folder';
+        this.notify('歌曲信息与搜索时不一致，请重新扫描并搜索。');
+        return;
+      }
+      const visible: string = working.metadata.lyrics.trim().length > 0 ? '重新读取发现已有可见歌词。' :
+        '重新读取没有发现可见歌词，但可能存在未识别的歌词标签。';
+      let handled: boolean = false;
+      const discard: () => void = () => {
+        if (handled) return;
+        handled = true;
+        if (token === this.missingSelectionToken) { this.invalidateMissingSelection(); this.page = 'folder'; }
+      };
+      this.getUIContext().showAlertDialog({
+        title: '确认载入候选歌词？',
+        message: '重新读取的歌曲：' + (working.metadata.title || working.sourceName) + '。' + visible +
+          ' 歌曲信息一致不能保证文件内容完全相同，请核对。继续会替换编辑区中的可见歌词；原文件不会自动修改。',
+        primaryButton: { value: '不载入', action: discard },
+        secondaryButton: { value: '载入编辑区', action: () => {
+          if (handled || token !== this.missingSelectionToken || this.page !== 'missingLyrics' ||
+              this.missingPending !== working || folder !== this.folderUri ||
+              !this.sameEditorSnapshot(snapshot)) return;
+          handled = true;
+          this.missingPending = undefined;
+          this.missingSelectionToken++;
+          this.adoptWorkingAudio(working);
+          this.lyricText = selection.text;
+          this.lyricSourceName = '';
+          this.lyricSummary = '补缺候选 · ' + selection.source + ' · 歌曲 ID ' + selection.songId;
+          this.currentTab = 0;
+          this.page = 'lyrics';
+          this.notify('候选歌词已载入；请核对，保存音频前不会修改原文件。');
+        } },
+        onDidDisappear: discard
+      });
+    } catch (error) {
+      if (token === this.missingSelectionToken) {
+        this.invalidateMissingSelection();
+        this.page = 'folder';
+        this.notify('无法重新读取所选音频：' + this.describeError(error));
+      }
+    } finally { this.busy = false; }
   }
 
   private async chooseFolder(): Promise<void> {
@@ -1099,6 +1871,7 @@ struct Index {
           if (lowerLyricSource.length > 0 && !lowerLyricSource.endsWith('.lrc') && !lowerLyricSource.endsWith('.txt')) {
             const document: LyricDocument = await parseLyricAsync(lyricText, item.lyricName);
             const converted = await convertToLrcAsync(document);
+            if (converted.text.trim().length === 0) throw new Error('歌词转换结果为空，已取消导出。');
             embeddedLyrics = converted.text;
             if (converted.warnings.length > 0) failureNotes.push(item.audioName + '：' + converted.warnings.join('；'));
           }
@@ -1176,6 +1949,47 @@ struct Index {
 
         if (this.page === 'editor') this.EditorView();
         else if (this.page === 'lyrics') this.LyricsView();
+        else if (this.page === 'cloudLyrics') {
+          CloudLyricsPage({
+            songTitle: this.songTitle, artist: this.artist, album: this.album,
+            durationMs: this.audioDurationMs, titleFromFilename: this.titleFromFilename,
+            audioKey: this.audioUri + '|' + this.audioWorkingPath, backRequest: this.cloudBackRequest,
+            previewVisible: $cloudPreviewVisible,
+            onApply: (selection: CloudLyricsSelection) => { this.confirmCloudLyrics(selection); },
+            onClose: () => { this.invalidateCloudDialog(); this.page = this.cloudReturnPage; }
+          })
+        }
+        else if (this.page === 'timing') {
+          LyricTimingPage({
+            targetKey: this.audioUri + '|' + this.audioWorkingPath,
+            workingPath: this.audioWorkingPath, filesDir: this.ctx().filesDir, originalText: this.lyricText,
+            onApply: (result: LyricTimingResult) => { this.applyLyricTiming(result); },
+            onClose: () => { this.page = 'lyrics'; },
+            onCleanupError: (message: string, _retry: () => Promise<void>) => {
+              this.notify('试听资源关闭失败：' + message + '。请重新启动应用后再试。');
+            }
+          })
+        }
+        else if (this.page === 'missingLyrics') {
+          MissingLyricsPage({
+            folderUri: this.folderUri, filesDir: this.ctx().filesDir,
+            onConfirm: (selection: MissingLyricsSelection) => { this.confirmMissingSelection(selection); },
+            onClose: () => { this.invalidateMissingSelection(); this.page = 'folder'; },
+            onCleanupError: (message: string): void => { this.notify(message); }
+          })
+        }
+        else if (this.page === 'draftRecovery') {
+          DraftRecoveryPanel({
+            editGeneration: this.draftEditGeneration,
+            onRestore: (result: DraftRestore, expected: number, claim: () => void): boolean =>
+              this.acceptDraft(result, expected, claim),
+            onCommitted: (session: DraftSession): void => { this.draftCommitted(session); },
+            onRecoveryIssue: (result: DraftRestore, state: string, warning: string): void =>
+              { this.draftRecoveryIssue(result, state, warning); },
+            onDeleted: (): void => { this.draftDeleted(); },
+            onLater: (): void => { this.closeDraftRecovery(); }
+          })
+        }
         else if (this.page === 'folder') this.FolderView();
         else this.ConfirmView();
 
@@ -1193,7 +2007,12 @@ struct Index {
         // 只延伸背景绘制，不改变内部组件的安全区布局。
         .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
 
-      if (this.activeGuide.length > 0) {
+      if (this.showAbout) {
+        Stack({ alignContent: Alignment.Center }) {
+          Column() { }.width('100%').height('100%').backgroundColor('#66000000')
+          AboutPage({ onClose: () => { this.showAbout = false; } })
+        }.width('100%').height('100%')
+      } else if (this.activeGuide.length > 0) {
         Stack({ alignContent: Alignment.Center }) {
           Column() { }.width('100%').height('100%').backgroundColor('#66000000')
             .onClick(() => this.closeGuide(false))
@@ -1206,9 +2025,12 @@ struct Index {
           this.HelpPanel()
         }.width('100%').height('100%')
       } else {
-        Text('?').fontSize(19).fontColor(BLUE).width(40).height(40).textAlign(TextAlign.Center)
+        Text('更多').id('home-more').fontSize(13).fontColor(BLUE).width(48).height(40).textAlign(TextAlign.Center)
           .backgroundColor('#E3F0FF').borderRadius(20).margin({ top: 16, right: 18 })
-          .onClick(() => { this.showHelp = true; })
+          .bindMenu([
+            { value: '使用帮助', action: () => { this.showHelp = true; } },
+            { value: '关于', action: () => { this.showAbout = true; } }
+          ])
       }
     }.width('100%').height('100%')
   }
@@ -1272,6 +2094,17 @@ struct Index {
   @Builder
   EditorView() {
     Column() {
+      Row({ space: 8 }) {
+        Text(this.draftStatus.length > 0 ? this.draftStatus : '编辑草稿')
+          .fontSize(11).fontColor(MUTED).layoutWeight(1).maxLines(3)
+        if (this.draftUncertain !== undefined) {
+          Button('处理').id('draft-issue').height(34).fontSize(11).enabled(!this.busy)
+            .onClick(() => this.acknowledgeDraftIssue())
+        } else {
+          Button('草稿').id('draft-open').height(34).fontSize(11).enabled(!this.busy)
+            .onClick(() => { this.openDraftRecovery(); })
+        }
+      }.width('100%').padding({ left: 16, right: 16, bottom: 8 })
       if (this.audioWorkingPath.length === 0) {
         Scroll() {
           Column({ space: 16 }) {
@@ -1348,7 +2181,10 @@ struct Index {
               Column({ space: 5 }) {
                 Text('歌曲标题').fontSize(12).fontColor(MUTED).width('100%')
                 TextInput({ text: this.songTitle, placeholder: '填写歌曲标题' }).enabled(!this.busy).height(44)
-                  .backgroundColor('#F5F7FB').borderRadius(12).onChange((v: string) => { this.songTitle = v; })
+                  .backgroundColor('#F5F7FB').borderRadius(12).onChange((v: string) => {
+                    if (v !== this.songTitle) this.titleFromFilename = false;
+                    this.songTitle = v;
+                  })
               }.width('100%')
               Column({ space: 5 }) {
                 Text('歌手').fontSize(12).fontColor(MUTED).width('100%')
@@ -1380,8 +2216,11 @@ struct Index {
                 Button('导入歌词').layoutWeight(1).height(40).enabled(!this.busy).backgroundColor('#F1F5FD')
                   .fontColor(BLUE).borderRadius(12).onClick(() => this.importLyrics())
                 Button('导出歌词').layoutWeight(1).height(40).enabled(!this.busy).backgroundColor('#F1F5FD')
-                  .fontColor(BLUE).borderRadius(12).onClick(() => this.exportLyrics())
+                  .fontColor(BLUE).borderRadius(12).onClick(() => this.requestLyricsExport())
               }.width('100%')
+              Button('云端搜歌词').id('editor-cloud-lyrics').width('100%').height(40).enabled(!this.busy)
+                .backgroundColor('#EDF3FF').fontColor(BLUE).borderRadius(12)
+                .onClick(() => this.openCloudLyrics('editor'))
             }.padding(16).width('100%').backgroundColor(Color.White).borderRadius(20)
 
             Column({ space: 10 }) {
@@ -1521,6 +2360,13 @@ struct Index {
         Button('返回歌曲').height(36).fontSize(12).backgroundColor('#EAF1FF').fontColor(BLUE)
           .borderRadius(12).enabled(!this.busy).onClick(() => { this.page = 'editor'; })
       }.width('100%').padding({ top: 2, bottom: 3 })
+      Button('云端搜歌词').id('lyrics-cloud-search').width('100%').height(40).fontSize(13).enabled(!this.busy)
+        .backgroundColor('#EAF1FF').fontColor(BLUE).borderRadius(12)
+        .onClick(() => this.openCloudLyrics('lyrics'))
+      Button('试听与校时').id('lyrics-timing').width('100%').height(40).fontSize(13)
+        .enabled(!this.busy && this.audioWorkingPath.length > 0 && this.lyricText.length > 0)
+        .backgroundColor('#EAF1FF').fontColor(BLUE).borderRadius(12)
+        .onClick(() => this.openLyricTiming())
       if (this.lyricSummary.length > 0) {
         Text(this.lyricSummary).fontSize(11).fontColor(MUTED).maxLines(2)
           .textOverflow({ overflow: TextOverflow.Ellipsis }).width('100%')
@@ -1555,7 +2401,7 @@ struct Index {
       Text('歌词暂存在本次编辑中；返回歌曲后还需保存音频。').fontSize(11).fontColor(MUTED).width('100%')
       Row({ space: 8 }) {
         Button('导出歌词').layoutWeight(1).height(46).enabled(!this.busy).backgroundColor(Color.White)
-          .fontColor(BLUE).borderRadius(15).onClick(() => this.exportLyrics())
+          .fontColor(BLUE).borderRadius(15).onClick(() => this.requestLyricsExport())
         Button('完成编辑').layoutWeight(1).height(46).enabled(!this.busy).backgroundColor(BLUE)
           .fontColor(Color.White).borderRadius(15).onClick(() => { this.page = 'editor'; this.notify('歌词已保留在当前编辑任务'); })
       }.width('100%')
@@ -1588,6 +2434,9 @@ struct Index {
             Button(this.busy ? '处理中…' : '扫描并匹配').width('100%').height(46).backgroundColor(BLUE)
               .fontColor(Color.White).borderRadius(15).enabled(!this.busy && this.folderUri.length > 0)
               .onClick(() => this.scanAndMatch())
+            Button('只补缺失歌词').id('missing-lyrics').width('100%').height(42)
+              .enabled(!this.busy && this.folderUri.length > 0)
+              .backgroundColor('#EDF3FF').fontColor(BLUE).borderRadius(13).onClick(() => this.openMissingLyrics())
             Text('扫描只读取文件；确认后可导出副本或选择批量直写原音频。').fontSize(11).fontColor(MUTED).width('100%')
           }.padding(17).width('100%').backgroundColor(Color.White).borderRadius(22)
 
